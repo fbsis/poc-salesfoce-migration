@@ -1,0 +1,10 @@
+node_modules
+.git
+.next
+**/.next
+coverage
+docs
+*.md
+.pnpm-store
+dist
+.tmp

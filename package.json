@@ -1,0 +1,27 @@
+{
+  "name": "poc-salesforce-migration",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "packageManager": "pnpm@10.8.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "pnpm -r --parallel --if-present run typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev:web": "pnpm --filter @poc/web run dev",
+    "dev:mcp": "pnpm --filter @poc/mcp run dev",
+    "dev:worker": "pnpm --filter @poc/worker run dev",
+    "dev:mock": "pnpm --filter @poc/salesforce-mock run dev",
+    "migrate": "tsx scripts/migrate.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "dotenv": "^16.4.7",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

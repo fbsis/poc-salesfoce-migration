@@ -1,0 +1,139 @@
+name: poc-salesforce-migration
+
+x-node-common: &node-common
+  build:
+    context: .
+    target: runtime
+  image: poc-salesforce-migration/node:latest
+  working_dir: /app
+  restart: "no"
+
+x-node-env: &node-env
+  NODE_ENV: development
+  DATABASE_URL: postgres://poc:poc@postgres:5432/poc_crm
+  TEST_DATABASE_URL: postgres://poc:poc@postgres:5432/poc_crm_test
+  CRM_API_TOKEN: poc-local-token
+  CRM_API_BASE_URL: http://web:3000
+  MCP_PORT: "3001"
+  MCP_AUTH_TOKEN: poc-local-token
+  LOG_LEVEL: info
+  # Salesforce: points at the local mock by default. Set SF_USE_MOCK=false and
+  # provide real credentials in .env to talk to a real org.
+  SF_USE_MOCK: "true"
+  SF_LOGIN_URL: http://salesforce-mock:4000
+  SF_INSTANCE_URL: http://salesforce-mock:4000
+  SF_CLIENT_ID: mock-client-id
+  SF_CLIENT_SECRET: mock-client-secret
+  SF_API_VERSION: "v62.0"
+  PUBSUB_ENDPOINT: salesforce-mock:50051
+  PUBSUB_TOPIC: /data/AccountChangeEvent
+  PUBSUB_TOPIC_OPPORTUNITY: /data/OpportunityChangeEvent
+  PUBSUB_TOPIC_CONTACT: /data/ContactChangeEvent
+  PUBSUB_TOPIC_LEAD: /data/LeadChangeEvent
+
+x-node-volumes: &node-volumes
+  - .:/app
+  - nm_root:/app/node_modules
+  - nm_web:/app/apps/web/node_modules
+  - nm_mcp:/app/apps/mcp/node_modules
+  - nm_worker:/app/apps/worker/node_modules
+  - nm_mock:/app/apps/salesforce-mock/node_modules
+  - nm_core:/app/packages/core/node_modules
+  - nm_sf:/app/packages/salesforce/node_modules
+  - next_cache:/app/apps/web/.next
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: poc
+      POSTGRES_PASSWORD: poc
+      POSTGRES_DB: poc_crm
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db:/db:ro
+      - ./docker/postgres-init.sh:/docker-entrypoint-initdb.d/10-poc-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U poc -d poc_crm"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  web:
+    <<: *node-common
+    command: pnpm --filter @poc/web run dev
+    environment:
+      <<: *node-env
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+      WATCHPACK_POLLING: "true"
+    volumes: *node-volumes
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      salesforce-mock:
+        condition: service_started
+
+  mcp:
+    <<: *node-common
+    command: pnpm --filter @poc/mcp run dev
+    environment: *node-env
+    volumes: *node-volumes
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      web:
+        condition: service_started
+
+  worker:
+    <<: *node-common
+    command: pnpm --filter @poc/worker run dev
+    environment:
+      <<: *node-env
+      WORKER_MODE: all
+    volumes: *node-volumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+      salesforce-mock:
+        condition: service_started
+
+  salesforce-mock:
+    <<: *node-common
+    command: pnpm --filter @poc/salesforce-mock run dev
+    environment: *node-env
+    volumes: *node-volumes
+    ports:
+      - "4000:4000"
+      - "50051:50051"
+
+  # Ad-hoc container for one-off commands:
+  #   docker compose run --rm tools pnpm typecheck
+  #   docker compose run --rm tools pnpm test
+  #   docker compose run --rm tools pnpm migrate
+  tools:
+    <<: *node-common
+    profiles: ["tools"]
+    command: ["true"]
+    environment: *node-env
+    volumes: *node-volumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  nm_root:
+  nm_web:
+  nm_mcp:
+  nm_worker:
+  nm_mock:
+  nm_core:
+  nm_sf:
+  next_cache:
