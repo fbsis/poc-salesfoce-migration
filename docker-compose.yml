@@ -6,6 +6,9 @@ x-node-common: &node-common
     target: runtime
   image: poc-salesforce-migration/node:latest
   working_dir: /app
+  # Reap zombies and forward SIGTERM/SIGINT to the node process (pnpm is PID 1
+  # otherwise, which swallows signals).
+  init: true
   restart: "no"
 
 x-node-env: &node-env
