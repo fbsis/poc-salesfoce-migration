@@ -15,7 +15,7 @@
     "dev:mcp": "pnpm --filter @poc/mcp run dev",
     "dev:worker": "pnpm --filter @poc/worker run dev",
     "dev:mock": "pnpm --filter @poc/salesforce-mock run dev",
-    "migrate": "tsx scripts/migrate.ts"
+    "migrate": "pnpm --filter @poc/core run migrate"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

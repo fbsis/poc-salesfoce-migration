@@ -8,7 +8,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Client } from 'pg';
 
-const MIGRATIONS_DIR = path.resolve(process.cwd(), 'db/migrations');
+const MIGRATIONS_DIR = path.resolve(import.meta.dirname, '../../../db/migrations');
 
 async function applyTo(connectionString: string, label: string) {
   const client = new Client({ connectionString });

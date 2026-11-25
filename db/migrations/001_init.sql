@@ -111,6 +111,18 @@ DROP TRIGGER IF EXISTS leads_set_updated_at ON leads;
 CREATE TRIGGER leads_set_updated_at BEFORE UPDATE ON leads
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+-- Contacts/opportunities can arrive before their parent Account (CDC ordering).
+-- The pending lookup is parked here until linkOrphanRecords() resolves it.
+CREATE TABLE IF NOT EXISTS sf_orphan_links (
+  entity                text NOT NULL CHECK (entity IN ('contact', 'opportunity')),
+  local_id              uuid NOT NULL,
+  account_salesforce_id text NOT NULL,
+  created_at            timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (entity, local_id)
+);
+CREATE INDEX IF NOT EXISTS sf_orphan_links_account_idx
+  ON sf_orphan_links (account_salesforce_id);
+
 -- -------------------------------------------------------- cdc checkpoints
 CREATE TABLE IF NOT EXISTS cdc_checkpoints (
   channel       text PRIMARY KEY,
