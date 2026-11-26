@@ -21,6 +21,8 @@ import {
   type ReconcileReport,
 } from '@poc/salesforce';
 
+import { startControlServer, type ControlServer } from './control';
+
 type Mode = 'bulk' | 'cdc' | 'reconcile' | 'all' | 'once';
 
 const MODES: readonly Mode[] = ['bulk', 'cdc', 'reconcile', 'all', 'once'];
@@ -31,6 +33,9 @@ const BULK_FRESH_WINDOW_MS = Number(process.env.WORKER_BULK_SKIP_WINDOW_MS ?? 10
 function log(message: string): void {
   console.log(`[worker] ${message}`);
 }
+
+/** Set once the control server is up; closed on shutdown. */
+let controlServer: ControlServer | null = null;
 
 function logError(message: string): void {
   console.error(`[worker] ${message}`);
@@ -192,6 +197,11 @@ async function run(mode: Mode, signal: Promise<string>): Promise<number> {
 
 async function finish(code: number): Promise<never> {
   try {
+    await controlServer?.close();
+  } catch (error) {
+    logError(`control shutdown failed: ${describe(error)}`);
+  }
+  try {
     await stopConsumer();
   } catch (error) {
     logError(`consumer shutdown failed: ${describe(error)}`);
@@ -219,6 +229,10 @@ async function entry(): Promise<void> {
     printUsage();
     process.exit(2);
   }
+
+  // Operational control plane (PORT_CONTROL, default 3002). Started in every
+  // mode so an E2E test can trigger a bulk extract without shelling out.
+  controlServer = await startControlServer({ mode });
 
   const signal = new Promise<string>((resolve) => {
     process.once('SIGTERM', () => resolve('SIGTERM'));

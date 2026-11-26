@@ -30,6 +30,7 @@ export interface MockHealth {
   subscribers: number;
   latestReplayId: number;
   latestCommitNumber: number;
+  queryJobPageSize: number;
 }
 
 export interface EmitResult {
@@ -91,6 +92,14 @@ export async function disconnectStreams(topic?: string): Promise<{ disconnected:
   return mockJson<{ disconnected: number }>('/mock/disconnect', {
     method: 'POST',
     body: JSON.stringify(topic ? { topic } : {}),
+  });
+}
+
+/** POST /mock/config — test hook for the mock's behaviour (query-job page size). */
+export async function setMockQueryPageJobSize(size: number): Promise<{ queryJobPageSize: number }> {
+  return mockJson<{ ok: boolean; queryJobPageSize: number }>('/mock/config', {
+    method: 'POST',
+    body: JSON.stringify({ queryJobPageSize: size }),
   });
 }
 

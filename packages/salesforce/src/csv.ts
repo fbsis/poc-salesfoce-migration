@@ -1,10 +1,12 @@
 /**
- * CSV helpers for Bulk API 2.0 query results.
+ * CSV helpers for Bulk API 2.0 **query** results.
  *
- * `successfulResults` is CSV whose first two columns are `sf__Id` and
- * `sf__Created`, followed by every queried field except `Id` (Salesforce omits
- * it because it duplicates `sf__Id`). `Owner.Name` arrives as a single flattened
- * column heading — `applySalesforceBatch` reads exactly that key.
+ * `jobs/query/:id/results` returns CSV whose header is exactly the SELECT list,
+ * e.g. `Id,Name,Industry,Owner.Name,SystemModstamp` — there is no `sf__Id` or
+ * `sf__Created` (those belong to ingest jobs). A relationship such as
+ * `Owner.Name` arrives as one flattened column, which is the key
+ * `applySalesforceBatch` reads. Empty cells become `null`; everything else is
+ * passed through verbatim (dates stay the strings Salesforce sent).
  */
 import { parse } from 'csv-parse/sync';
 import type { SalesforceRecord } from '@poc/core';
@@ -34,19 +36,25 @@ export function parseCsv(text: string): ParsedCsv {
 }
 
 /**
- * Convert one Bulk result row into a Salesforce-shaped record.
- * `sf__Id` becomes `Id`; other `sf__*` bookkeeping columns are dropped.
+ * Convert one query-result row into a Salesforce-shaped record.
+ *
+ * The query-results header *is* the record shape (`Id`, `Owner.Name`, …), so the
+ * columns are copied as-is. `sf__*` bookkeeping is not part of the query
+ * contract; it is skipped defensively so an ingest CSV can never leak in.
  */
 export function rowToRecord(row: Record<string, string>): SalesforceRecord {
-  const record: SalesforceRecord = { Id: String(row.sf__Id ?? row.Id ?? '').trim() };
+  const record: SalesforceRecord = { Id: '' };
   for (const [column, value] of Object.entries(row)) {
-    if (column === 'sf__Id' || column.startsWith('sf__')) continue;
-    if (column === 'Id') continue;
-    record[column] = value === '' ? null : value;
+    const key = column.trim();
+    if (key === '' || key === 'attributes' || key.startsWith('sf__')) continue;
+    record[key] = value === '' ? null : value;
   }
+  record.Id = String(record.Id ?? '').trim();
   return record;
 }
 
 export function rowsToRecords(rows: Array<Record<string, string>>): SalesforceRecord[] {
+  // Query jobs are always asked for `Id` (see `buildSoql`), so a row without one
+  // cannot be upserted and is dropped — same contract as before the rewrite.
   return rows.map(rowToRecord).filter((record) => record.Id !== '');
 }

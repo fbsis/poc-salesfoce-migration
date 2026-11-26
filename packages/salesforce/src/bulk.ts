@@ -1,12 +1,17 @@
 /**
- * Bulk API 2.0 **query** jobs (`docs/CONTRACTS.md` §7).
+ * Bulk API 2.0 **query** jobs (`docs/CONTRACTS.md` §6, "Bulk query jobs (corrected)").
  *
- * Flow per object, exactly as the mock implements it:
- *   1. POST  /services/data/:v/jobs/ingest              { object, operation:'query', contentType:'CSV' }
- *   2. PUT   /services/data/:v/jobs/ingest/:id/batches  body = SOQL text
- *   3. PATCH /services/data/:v/jobs/ingest/:id          { state:'UploadComplete' } → InProgress
- *   4. GET   /services/data/:v/jobs/ingest/:id          poll until JobComplete / JobFailed
- *   5. GET   /services/data/:v/jobs/ingest/:id/successfulResults   CSV (`sf__Id`,`sf__Created`,…)
+ * Flow per object — the real Salesforce contract, not an ingest-shaped fake:
+ *   1. POST  /services/data/:v/jobs/query   { operation:'query', query: SOQL, contentType:'CSV' }
+ *      → the job returns `UploadComplete`; the SOQL travels in the *create* body.
+ *   2. (no batch upload: `PUT …/batches` is ingest-only and a query job takes no data)
+ *   3. GET   /services/data/:v/jobs/query/:id          poll until `JobComplete`
+ *   4. GET   /services/data/:v/jobs/query/:id/results  CSV of the selected columns,
+ *      paged via the `Sforce-Query-Locator` response header + `?locator=`.
+ *
+ * Results contain **only** the queried columns (plus `Id` when it was selected) —
+ * there is no `sf__Id`/`sf__Created` bookkeeping. `SystemModstamp` and friends are
+ * passed through exactly as returned.
  *
  * Then `applySalesforceBatch` from `@poc/core` upserts the records. Core owns
  * the unique key (`salesforce_id`), so running this twice is a no-op on row
@@ -19,7 +24,7 @@ import {
   type SalesforceRecord,
 } from '@poc/core';
 
-import { dataPath, sfJson, sfRequest, sfText } from './http';
+import { SalesforceApiError, dataPath, sfJson, sfRequest } from './http';
 import { parseCsv, rowsToRecords } from './csv';
 import {
   OBJECT_NAMES,
@@ -35,6 +40,8 @@ export interface BulkJobStatus {
   state: string;
   numberRecordsProcessed?: number;
   numberRecordsFailed?: number;
+  retries?: number;
+  totalProcessingTime?: number;
   errorMessage?: string | null;
 }
 
@@ -81,45 +88,38 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 const DEFAULT_POLL = { initialDelayMs: 200, maxDelayMs: 2_000, timeoutMs: 120_000 };
 
+/** Safety stop for the result-page loop (real jobs page far below this). */
+const MAX_RESULT_PAGES = 10_000;
+
+const QUERY_JOB_PATH = 'jobs/query';
+
 function jobStateIsTerminalFailure(state: string): boolean {
   return state === 'Failed' || state === 'Aborted' || state === 'JobFailed';
 }
 
-/** Create + upload + close a Bulk 2.0 query job. Returns the job id. */
+/**
+ * Create a Bulk API 2.0 **query** job: the SOQL is the body of the create call.
+ * There is no batch upload — the job is `UploadComplete` when it comes back.
+ */
 export async function createQueryJob(
   object: SalesforceObjectName,
   soql: string,
 ): Promise<string> {
-  const created = await sfJson<BulkJobStatus>('POST', dataPath('jobs/ingest'), {
+  const created = await sfJson<BulkJobStatus>('POST', dataPath(QUERY_JOB_PATH), {
     contentType: 'application/json',
     body: JSON.stringify({
-      object,
       operation: 'query',
+      query: soql,
       contentType: 'CSV',
-      columnDelimiter: 'COMMA',
+      columnDelimiter: ',',
       lineEnding: 'LF',
     }),
   });
-  if (!created?.id) throw new Error(`Bulk job creation returned no id for ${object}`);
-
-  const upload = await sfRequest('PUT', dataPath(`jobs/ingest/${created.id}/batches`), {
-    body: soql,
-    contentType: 'text/csv',
-    accept: 'application/json',
-  });
-  if (!upload.ok) {
-    const body = await upload.text().catch(() => '');
-    throw new Error(`Bulk upload for ${object} failed (${upload.status}): ${body.slice(0, 300)}`);
-  }
-
-  await sfJson('PATCH', dataPath(`jobs/ingest/${created.id}`), {
-    contentType: 'application/json',
-    body: JSON.stringify({ state: 'UploadComplete' }),
-  });
+  if (!created?.id) throw new Error(`Bulk query job creation returned no id for ${object}`);
   return created.id;
 }
 
-/** Poll a job until it completes. Backoff 200ms → 2s, hard cap ~2 minutes. */
+/** Poll a query job until it completes. Backoff 200ms → 2s, hard cap ~2 minutes. */
 export async function waitForJob(
   jobId: string,
   poll: BulkExtractOptions['poll'] = {},
@@ -131,17 +131,17 @@ export async function waitForJob(
   const startedAt = Date.now();
   let delay = initial;
   for (;;) {
-    const status = await sfJson<BulkJobStatus>('GET', dataPath(`jobs/ingest/${jobId}`));
+    const status = await sfJson<BulkJobStatus>('GET', dataPath(`${QUERY_JOB_PATH}/${jobId}`));
     if (status.state === 'JobComplete') return status;
     if (jobStateIsTerminalFailure(status.state)) {
       throw new Error(
-        `Bulk job ${jobId} ended in state ${status.state}` +
+        `Bulk query job ${jobId} ended in state ${status.state}` +
           (status.errorMessage ? `: ${status.errorMessage}` : ''),
       );
     }
     if (Date.now() - startedAt > timeout) {
       throw new Error(
-        `Bulk job ${jobId} did not complete within ${timeout}ms (last state ${status.state})`,
+        `Bulk query job ${jobId} did not complete within ${timeout}ms (last state ${status.state})`,
       );
     }
     await sleep(delay);
@@ -149,11 +149,48 @@ export async function waitForJob(
   }
 }
 
-/** Download + parse `successfulResults` for a completed job. */
-export async function downloadResults(jobId: string): Promise<{ raw: string; records: SalesforceRecord[] }> {
-  const raw = await sfText('GET', dataPath(`jobs/ingest/${jobId}/successfulResults`));
-  const { rows } = parseCsv(raw);
-  return { raw, records: rowsToRecords(rows) };
+/**
+ * Download every page of a completed job's `results` and concatenate them.
+ *
+ * Each page is CSV with the same header; the next page is requested with the
+ * opaque `Sforce-Query-Locator` value and paging stops when the header is
+ * `null` (or absent). `raw` is the concatenation of the pages as returned.
+ */
+export async function downloadResults(
+  jobId: string,
+): Promise<{ raw: string; records: SalesforceRecord[]; pages: number }> {
+  const rawPages: string[] = [];
+  const rows: Array<Record<string, string>> = [];
+  let locator: string | null = null;
+  let pages = 0;
+
+  for (;;) {
+    if (pages >= MAX_RESULT_PAGES) {
+      throw new Error(`Bulk query job ${jobId} returned more than ${MAX_RESULT_PAGES} pages`);
+    }
+    const suffix = locator
+      ? `${QUERY_JOB_PATH}/${jobId}/results?locator=${encodeURIComponent(locator)}`
+      : `${QUERY_JOB_PATH}/${jobId}/results`;
+    const response = await sfRequest('GET', dataPath(suffix), { accept: 'text/csv' });
+    const text = await response.text();
+    pages += 1;
+    if (!response.ok) {
+      throw new SalesforceApiError(
+        `Salesforce GET ${suffix} → ${response.status}: ${text.slice(0, 300)}`,
+        response.status,
+        `HTTP_${response.status}`,
+        text.slice(0, 300),
+      );
+    }
+    rawPages.push(text);
+    rows.push(...parseCsv(text).rows);
+
+    const next = response.headers.get('sforce-query-locator');
+    if (!next || next === 'null' || next.trim() === '') break;
+    locator = next.trim();
+  }
+
+  return { raw: rawPages.join(''), records: rowsToRecords(rows), pages };
 }
 
 /** Run one Bulk API 2.0 query job for `objectName` and return its records. */

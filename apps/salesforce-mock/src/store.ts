@@ -360,8 +360,16 @@ export class SalesforceStore {
       if (input.changeType === 'UNDELETE') next.IsDeleted = false;
     }
     if (!next.CreatedDate) next.CreatedDate = toSfDateTime(now);
-    next.LastModifiedDate = toSfDateTime(now);
-    next.SystemModstamp = toSfDateTime(now);
+    // A caller may *pin* the record timestamp by putting `SystemModstamp` on the
+    // emitted record (used to exercise the stale-write guard from an E2E test).
+    // Otherwise the mock stamps the event with "now", so successive events for
+    // the same record always move forward — a partial UPDATE `{ Id, StageName }`
+    // must never inherit the previous stamp from `existing`.
+    const pinnedStamp =
+      typeof incoming.SystemModstamp === 'string' ? incoming.SystemModstamp.trim() : '';
+    const stamp = pinnedStamp === '' ? toSfDateTime(now) : pinnedStamp;
+    next.LastModifiedDate = stamp;
+    next.SystemModstamp = stamp;
 
     // changed / nulled / diff field lists -----------------------------------
     let changedFields: string[];

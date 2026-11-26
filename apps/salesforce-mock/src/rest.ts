@@ -1,21 +1,27 @@
 /**
  * REST surface of the mock Salesforce org (port 4000).
  *
- *  POST /services/oauth2/token                          client_credentials → mock token
- *  POST /services/data/:version/jobs/ingest             Bulk API 2.0 query job (create)
- *  PUT  /services/data/:version/jobs/ingest/:id/batches upload SOQL (or a CSV header row)
- *  PATCH/services/data/:version/jobs/ingest/:id         { state: 'UploadComplete' }
- *  GET  /services/data/:version/jobs/ingest/:id         job status
- *  GET  /services/data/:version/jobs/ingest/:id/successfulResults
- *  GET  /services/data/:version/jobs/ingest/:id/failedResults
- *  GET  /services/data/:version/query?q=SELECT+…       synchronous SOQL
- *  /mock/{health,seed,state,reset,emit,disconnect}      admin (no auth, demo only)
+ *  POST /services/oauth2/token                     client_credentials → mock token
+ *  POST /services/data/:version/jobs/query         Bulk API 2.0 **query** job (create, SOQL in the body)
+ *  GET  /services/data/:version/jobs/query/:id     job status (poll)
+ *  GET  /services/data/:version/jobs/query/:id/results   CSV of the selected columns, paged
+ *  GET  /services/data/:version/query?q=SELECT+…   synchronous SOQL
+ *  /mock/{health,state,seed,reset,emit,disconnect,config}  admin (no auth, demo only)
  *
- * Bulk API 2.0 detail: successfulResults is CSV with `sf__Id` and `sf__Created`
- * first, then every queried field except `Id` (which would be redundant with
- * `sf__Id`). `failedResults` returns its header only (the mock never fails a
- * query row). Job state machine: Open → InProgress (PATCH UploadComplete) →
- * JobComplete (one 250 ms tick later).
+ * Bulk API 2.0 query-job detail (the real contract — see docs/CONTRACTS.md §6
+ * "Bulk query jobs (corrected)"):
+ *  - the SOQL is supplied **when the job is created**; a query job takes no
+ *    batch upload, so `PUT …/jobs/ingest/:id/batches` is not part of this flow;
+ *  - the job is `UploadComplete` immediately, then `InProgress`, then
+ *    `JobComplete` (state is advanced lazily from the job's age, one 300 ms tick);
+ *  - `results` is CSV whose header is exactly the SELECT list (no `sf__Id`,
+ *    no `sf__Created`), and a zero-row query still returns the header row;
+ *  - results are paged: 2000 rows per page, the next page's token is returned in
+ *    the `Sforce-Query-Locator` response header and echoed back as `?locator=`;
+ *    the last page sends `Sforce-Query-Locator: null`.
+ *
+ * Bulk **ingest** jobs (data upload) are not implemented: this mock only does
+ * query jobs, so `/services/data/:version/jobs/ingest…` answers 404.
  */
 
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
@@ -41,7 +47,6 @@ import type { PubSubControl } from './grpc';
 const API_VERSION = process.env.SF_API_VERSION ?? 'v62.0';
 const ACCESS_TOKEN = process.env.SF_MOCK_ACCESS_TOKEN ?? 'mock-access-token';
 const CONFIGURED_INSTANCE_URL = process.env.SF_INSTANCE_URL ?? '';
-const JOB_COMPLETE_DELAY_MS = 250;
 
 const DATE_FIELDS = new Set(['SystemModstamp', 'LastModifiedDate', 'CreatedDate', 'CloseDate']);
 
@@ -91,23 +96,6 @@ export function parseCsvLine(line: string, delimiter = ','): string[] {
   return cells;
 }
 
-/** First non-empty CSV line, quote-aware (the body may have \r\n endings). */
-function firstNonEmptyLine(text: string): string {
-  let inQuotes = false;
-  let line = '';
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index];
-    if (char === '"') inQuotes = !inQuotes;
-    if (!inQuotes && (char === '\n' || char === '\r')) {
-      if (line.trim() !== '') return line;
-      line = '';
-      continue;
-    }
-    line += char;
-  }
-  return line;
-}
-
 // -------------------------------------------------------------- SOQL parsing
 
 interface SoqlQuery {
@@ -123,7 +111,7 @@ interface FilterClause {
   values: string[];
 }
 
-export function parseSoql(soql: string): SoqlQuery {
+export function parseSoql(soql: string, options: { injectId?: boolean } = {}): SoqlQuery {
   const text = soql.trim().replace(/;$/, '');
   const match = /^select\s+([\s\S]+?)\s+from\s+([A-Za-z_][A-Za-z0-9_]*)([\s\S]*)$/i.exec(text);
   if (!match) throw new Error(`Invalid SOQL: ${soql}`);
@@ -139,7 +127,10 @@ export function parseSoql(soql: string): SoqlQuery {
       return alias ? alias[1] : field;
     });
   if (fields.length === 0) throw new Error(`Invalid SOQL (no fields): ${soql}`);
-  ensureIdField(fields);
+  // The synchronous `/query` endpoint always needs an id (`attributes.url`); a
+  // Bulk **query job** must return exactly the columns the caller selected, so
+  // it passes `injectId: false`.
+  if (options.injectId !== false) ensureIdField(fields);
   const tail = match[3] ?? '';
   const whereMatch = /\bwhere\b([\s\S]*?)(?:\border\s+by\b|\blimit\b|$)/i.exec(tail);
   const limitMatch = /\blimit\s+(\d+)/i.exec(tail);
@@ -355,30 +346,42 @@ function csvValue(value: unknown): unknown {
   return value;
 }
 
-// ------------------------------------------------------------- bulk API jobs
+// ------------------------------------------------ bulk API 2.0 query jobs
 
-type JobState = 'Open' | 'InProgress' | 'JobComplete' | 'Failed' | 'Aborted';
+/** Bulk API 2.0 query-job states (a query job never sits in `Open`). */
+type QueryJobState = 'UploadComplete' | 'InProgress' | 'JobComplete' | 'Failed' | 'Aborted';
 
-interface BulkJob {
+/** Rows per `results` page, before `Sforce-Query-Locator` paging kicks in. */
+export const MAX_RESULT_PAGE_SIZE = 2000;
+
+/** A freshly created query job is `UploadComplete`; it then advances on its own. */
+const JOB_IN_PROGRESS_AFTER_MS = 50;
+const JOB_COMPLETE_AFTER_MS = 300;
+
+interface QueryJob {
   id: string;
   object: SfObject;
   operation: 'query';
-  state: JobState;
+  state: QueryJobState;
   contentType: string;
   columnDelimiter: string;
   lineEnding: string;
-  soql: string | null;
+  soql: string;
+  /** Exactly the SELECT list — the results CSV header, nothing else. */
   fields: string[];
+  where: string | null;
+  limit: number | null;
   records: SfRecord[];
   numberRecordsProcessed: number;
   numberRecordsFailed: number;
   errorMessage: string | null;
   createdDate: string;
   systemModstamp: string;
-  completedAt: number | null;
+  createdAtMs: number;
+  totalProcessingTime: number;
 }
 
-function jobSummary(job: BulkJob): Record<string, unknown> {
+function jobSummary(job: QueryJob): Record<string, unknown> {
   return {
     id: job.id,
     object: job.object,
@@ -395,30 +398,72 @@ function jobSummary(job: BulkJob): Record<string, unknown> {
     lineEnding: job.lineEnding,
     numberRecordsProcessed: job.numberRecordsProcessed,
     numberRecordsFailed: job.numberRecordsFailed,
-    retryCount: 0,
-    totalProcessingTime: 0,
-    apiActiveProcessingTime: 0,
+    retries: 0,
+    totalProcessingTime: job.totalProcessingTime,
+    apiActiveProcessingTime: job.totalProcessingTime,
     apexProcessingTime: 0,
     errorMessage: job.errorMessage,
   };
 }
 
-/** Extracts the SOQL text, or the field list from a CSV header row. */
-function batchFieldList(body: string): { soql: string | null; fields: string[] } {
-  const text = body.replace(/^\uFEFF/, '').trim();
-  if (!text) return { soql: null, fields: [] };
-  const unquoted =
-    text.startsWith('"') && text.endsWith('"') ? text.slice(1, -1).replace(/""/g, '"') : text;
-  if (/^select\b/i.test(unquoted)) {
-    const parsed = parseSoql(unquoted);
-    return { soql: unquoted, fields: parsed.fields };
+/** `,` | `|` | `;` | `^` | `\t` — the names (`COMMA`, `TAB`, …) are accepted too. */
+function delimiterFor(value: string): string {
+  const named: Record<string, string> = {
+    COMMA: ',',
+    PIPE: '|',
+    SEMICOLON: ';',
+    CARET: '^',
+    TAB: '\t',
+  };
+  const trimmed = value.trim();
+  return named[trimmed.toUpperCase()] ?? (trimmed === '' ? ',' : trimmed);
+}
+
+function lineEndingFor(value: string): string {
+  return value.trim().toUpperCase() === 'CRLF' ? '\r\n' : '\n';
+}
+
+/** Result pages are addressed by an opaque `Sforce-Query-Locator` token. */
+function encodeLocator(offset: number): string {
+  return Buffer.from(`locator:${offset}`, 'utf8').toString('base64url');
+}
+
+function decodeLocator(value: string): number | null {
+  try {
+    const decoded = Buffer.from(value, 'base64url').toString('utf8');
+    const match = /^locator:(\d+)$/.exec(decoded);
+    return match ? Number(match[1]) : null;
+  } catch {
+    return null;
   }
-  const header = firstNonEmptyLine(text);
-  const fields = parseCsvLine(header)
-    .map((field) => field.replace(/^\uFEFF/, '').trim())
-    .filter(Boolean);
-  ensureIdField(fields);
-  return { soql: null, fields };
+}
+
+/**
+ * Advance the job's state machine from its age and, on completion, snapshot the
+ * query result. Idempotent — every read path calls it before answering.
+ */
+function advanceJob(store: SalesforceStore, job: QueryJob): void {
+  if (job.state === 'JobComplete' || job.state === 'Failed' || job.state === 'Aborted') return;
+  const elapsed = Date.now() - job.createdAtMs;
+  if (elapsed < JOB_IN_PROGRESS_AFTER_MS) {
+    job.state = 'UploadComplete';
+    return;
+  }
+  if (elapsed < JOB_COMPLETE_AFTER_MS) {
+    job.state = 'InProgress';
+    return;
+  }
+  try {
+    job.records = selectRecords(store, job.object, job.where, job.limit);
+    job.numberRecordsProcessed = job.records.length;
+    job.numberRecordsFailed = 0;
+    job.state = 'JobComplete';
+  } catch (error) {
+    job.state = 'Failed';
+    job.errorMessage = error instanceof Error ? error.message : String(error);
+  }
+  job.totalProcessingTime = elapsed;
+  job.systemModstamp = toSfDateTime(new Date());
 }
 
 function instanceUrl(req: Request): string {
@@ -453,6 +498,12 @@ const disconnectBodySchema = z
   })
   .passthrough();
 
+const configBodySchema = z
+  .object({
+    queryJobPageSize: z.number().int().min(1).max(MAX_RESULT_PAGE_SIZE).optional(),
+  })
+  .passthrough();
+
 export interface RestAppOptions {
   store: SalesforceStore;
   pubsub: PubSubControl;
@@ -461,8 +512,16 @@ export interface RestAppOptions {
 export function createRestApp(options: RestAppOptions): Express {
   const { store, pubsub } = options;
   const app = express();
-  const jobs = new Map<string, BulkJob>();
+  const jobs = new Map<string, QueryJob>();
   let jobCounter = 0;
+  // Rows per `results` page. Real Bulk 2.0 pages well below its 2000-row cap;
+  // the mock pages at exactly 2000 so the client's locator loop is exercised,
+  // and `/mock/config` can lower it to prove multi-page concatenation.
+  const configuredPageSize = Number(process.env.SF_MOCK_QUERY_PAGE_SIZE ?? NaN);
+  let queryJobPageSize =
+    Number.isFinite(configuredPageSize) && configuredPageSize > 0
+      ? Math.min(Math.floor(configuredPageSize), MAX_RESULT_PAGE_SIZE)
+      : MAX_RESULT_PAGE_SIZE;
 
   app.disable('x-powered-by');
   app.use(cors());
@@ -494,11 +553,29 @@ export function createRestApp(options: RestAppOptions): Express {
       },
       latestReplayId: store.latestReplayId,
       latestCommitNumber: store.latestCommitNumber,
+      queryJobPageSize,
       uptimeSeconds: Math.round(process.uptime()),
     });
   };
   app.get('/mock/health', health);
   app.get('/health', health);
+
+  app.get('/mock/config', (_req: Request, res: Response) => {
+    res.json({ queryJobPageSize });
+  });
+
+  /** Test hook: shrink the query-result page size so paging is observable. */
+  app.post('/mock/config', (req: Request, res: Response) => {
+    const parsed = configBodySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json(salesforceError(parsed.error.message, 'INVALID_INPUT'));
+      return;
+    }
+    if (parsed.data.queryJobPageSize !== undefined) {
+      queryJobPageSize = parsed.data.queryJobPageSize;
+    }
+    res.json({ ok: true, queryJobPageSize });
+  });
 
   app.post('/mock/seed', (req: Request, res: Response) => {
     const parsed = seedBodySchema.safeParse(req.body ?? {});
@@ -634,252 +711,148 @@ export function createRestApp(options: RestAppOptions): Express {
     });
   });
 
-  // ------------------------------------------------------- Bulk API 2.0 jobs
+  // ------------------------------------------------- Bulk API 2.0 query jobs
 
-  const createJob = (req: Request, res: Response): void => {
+  /**
+   * Create a query job. The SOQL arrives **in the create body** — this is the
+   * whole difference from an ingest job: there is no batch upload afterwards,
+   * and the job is `UploadComplete` as soon as it exists.
+   */
+  app.post('/services/data/:version/jobs/query', (req: Request, res: Response) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
-    // Accept the SOQL in the create body as a convenience (real Bulk 2.0 takes
-    // it in the batch upload); the object is derived from the query when absent.
-    const inlineSoql =
-      typeof body.query === 'string'
-        ? body.query
-        : typeof body.soql === 'string'
-          ? body.soql
-          : null;
-    let parsedInline: SoqlQuery | null = null;
-    if (inlineSoql) {
-      try {
-        parsedInline = parseSoql(inlineSoql);
-      } catch (error) {
-        res
-          .status(400)
-          .json(
-            salesforceError(
-              error instanceof Error ? error.message : String(error),
-              'MALFORMED_QUERY',
-            ),
-          );
-        return;
-      }
-    }
-    const object = toObjectName(String(body.object ?? parsedInline?.object ?? ''));
-    if (!object || !isSfObject(object)) {
-      res
-        .status(400)
-        .json(salesforceError(`Invalid object: ${String(body.object)}`, 'INVALIDJOB'));
-      return;
-    }
     const operation = String(body.operation ?? 'query');
     if (operation !== 'query') {
+      res.status(400).json(salesforceError(`Unsupported operation: ${operation}`, 'INVALIDJOB'));
+      return;
+    }
+    const soql = typeof body.query === 'string' ? body.query.trim() : '';
+    if (!soql) {
       res
         .status(400)
-        .json(salesforceError(`Unsupported operation: ${operation}`, 'INVALIDJOB'));
+        .json(salesforceError('A query job requires a `query` (SOQL) property', 'MALFORMED_QUERY'));
+      return;
+    }
+    let parsed: SoqlQuery;
+    try {
+      // No id injection: the results header is exactly the SELECT list.
+      parsed = parseSoql(soql, { injectId: false });
+    } catch (error) {
+      res
+        .status(400)
+        .json(
+          salesforceError(
+            error instanceof Error ? error.message : String(error),
+            'MALFORMED_QUERY',
+          ),
+        );
       return;
     }
     const now = new Date();
-    const job: BulkJob = {
+    const job: QueryJob = {
       id: sfId('750', ++jobCounter),
-      object,
+      object: parsed.object,
       operation: 'query',
-      state: 'Open',
+      state: 'UploadComplete',
       contentType: String(body.contentType ?? 'CSV'),
-      columnDelimiter: String(body.columnDelimiter ?? 'COMMA'),
+      columnDelimiter: String(body.columnDelimiter ?? ','),
       lineEnding: String(body.lineEnding ?? 'LF'),
-      soql: inlineSoql,
-      fields: parsedInline?.fields ?? [],
+      soql,
+      fields: parsed.fields,
+      where: parsed.where,
+      limit: parsed.limit,
       records: [],
       numberRecordsProcessed: 0,
       numberRecordsFailed: 0,
       errorMessage: null,
       createdDate: toSfDateTime(now),
       systemModstamp: toSfDateTime(now),
-      completedAt: null,
+      createdAtMs: now.getTime(),
+      totalProcessingTime: 0,
     };
     jobs.set(job.id, job);
     res
-      .status(201)
-      .location(`/services/data/${req.params.version}/jobs/ingest/${job.id}`)
+      .status(200)
+      .location(`/services/data/${req.params.version}/jobs/query/${job.id}`)
       .json(jobSummary(job));
-  };
-
-  app.post('/services/data/:version/jobs/ingest', createJob);
-  app.post('/services/data/:version/jobs/query', createJob);
-
-  const rawBody = express.raw({ type: () => true, limit: '50mb', inflate: true });
-
-  app.put(
-    '/services/data/:version/jobs/ingest/:id/batches',
-    rawBody,
-    (req: Request, res: Response) => {
-      const job = jobs.get(String(req.params.id));
-      if (!job) {
-        res.status(404).json(salesforceError('The requested resource does not exist', 'NOT_FOUND'));
-        return;
-      }
-      if (job.state !== 'Open') {
-        res
-          .status(400)
-          .json(
-            salesforceError(
-              `Job is not open for uploads (state=${job.state})`,
-              'INVALIDJOBSTATE',
-            ),
-          );
-        return;
-      }
-      const raw = req.body;
-      const text = Buffer.isBuffer(raw)
-        ? raw.toString('utf8')
-        : typeof raw === 'string'
-          ? raw
-          : JSON.stringify(raw ?? '');
-      try {
-        const { soql, fields } = batchFieldList(text);
-        job.soql = soql;
-        job.fields = fields;
-        job.systemModstamp = toSfDateTime(new Date());
-      } catch (error) {
-        res
-          .status(400)
-          .json(
-            salesforceError(
-              error instanceof Error ? error.message : String(error),
-              'MALFORMED_QUERY',
-            ),
-          );
-        return;
-      }
-      res.status(201).json({ id: job.id, state: job.state });
-    },
-  );
-
-  app.patch('/services/data/:version/jobs/ingest/:id', (req: Request, res: Response) => {
-    const job = jobs.get(String(req.params.id));
-    if (!job) {
-      res.status(404).json(salesforceError('The requested resource does not exist', 'NOT_FOUND'));
-      return;
-    }
-    const state = String((req.body as Record<string, unknown>)?.state ?? '');
-    if (state === 'UploadComplete') {
-      if (job.state === 'Open') {
-        job.state = 'InProgress';
-        job.systemModstamp = toSfDateTime(new Date());
-        setTimeout(() => completeJob(job), JOB_COMPLETE_DELAY_MS).unref();
-      }
-      res.json(jobSummary(job));
-      return;
-    }
-    if (state === 'Aborted') {
-      job.state = 'Aborted';
-      job.errorMessage = 'Job aborted by user';
-      job.completedAt = Date.now();
-      job.systemModstamp = toSfDateTime(new Date());
-      res.json(jobSummary(job));
-      return;
-    }
-    res
-      .status(400)
-      .json(salesforceError(`Unsupported state transition: ${state || '(empty)'}`, 'INVALIDJOB'));
   });
 
-  app.get('/services/data/:version/jobs/ingest/:id', (req: Request, res: Response) => {
+  app.get('/services/data/:version/jobs/query/:id', (req: Request, res: Response) => {
     const job = jobs.get(String(req.params.id));
     if (!job) {
       res.status(404).json(salesforceError('The requested resource does not exist', 'NOT_FOUND'));
       return;
     }
+    advanceJob(store, job);
     res.json(jobSummary(job));
   });
 
-  function completeJob(job: BulkJob): void {
-    if (job.state !== 'InProgress') return;
-    try {
-      const parsed = job.soql ? parseSoql(job.soql) : null;
-      const fields = ensureIdField([...(parsed?.fields ?? job.fields)]);
-      const records = selectRecords(
-        store,
-        job.object,
-        parsed?.where ?? null,
-        parsed?.limit ?? null,
-      );
-      job.fields = fields;
-      job.records = records;
-      job.numberRecordsProcessed = records.length;
-      job.numberRecordsFailed = 0;
-      job.state = 'JobComplete';
-      job.completedAt = Date.now();
-    } catch (error) {
-      job.state = 'Failed';
-      job.errorMessage = error instanceof Error ? error.message : String(error);
+  /**
+   * One page of results: CSV whose header is exactly the SELECT list (no
+   * `sf__Id`, no `sf__Created`), zero rows still yields the header row, and the
+   * next page's token travels in `Sforce-Query-Locator` (`null` when done).
+   */
+  app.get('/services/data/:version/jobs/query/:id/results', (req: Request, res: Response) => {
+    const job = jobs.get(String(req.params.id));
+    if (!job) {
+      res.status(404).json(salesforceError('The requested resource does not exist', 'NOT_FOUND'));
+      return;
     }
-    job.systemModstamp = toSfDateTime(new Date());
-  }
+    advanceJob(store, job);
+    if (job.state !== 'JobComplete') {
+      res
+        .status(400)
+        .json(salesforceError(`Job is not complete (state=${job.state})`, 'INVALIDJOBSTATE'));
+      return;
+    }
 
-  function resultsCsv(job: BulkJob, withErrors: boolean): string {
-    const fields = job.fields.filter((field) => field.toLowerCase() !== 'id');
-    const header = withErrors
-      ? ['sf__Id', 'sf__Error', ...fields]
-      : ['sf__Id', 'sf__Created', ...fields];
-    const lines: string[] = [csvRow(header)];
-    if (withErrors) return `${lines.join('\n')}\n`;
-    for (const record of job.records) {
+    const rawLocator = typeof req.query.locator === 'string' ? req.query.locator : null;
+    const start = rawLocator ? decodeLocator(rawLocator) : 0;
+    if (start === null) {
+      res
+        .status(400)
+        .json(salesforceError(`Invalid locator: ${rawLocator}`, 'INVALID_PARAMETER'));
+      return;
+    }
+    const page = job.records.slice(start, start + queryJobPageSize);
+    const nextOffset = start + page.length;
+    const locator = nextOffset < job.records.length ? encodeLocator(nextOffset) : null;
+
+    const delimiter = delimiterFor(job.columnDelimiter);
+    const eol = lineEndingFor(job.lineEnding);
+    const lines = [job.fields.map((field) => csvEscape(field)).join(delimiter)];
+    for (const record of page) {
       lines.push(
-        csvRow([
-          String(record.Id),
-          'true',
-          ...fields.map((field) => csvValue(resolveField(record, field))),
-        ]),
+        job.fields
+          .map((field) => csvEscape(csvValue(resolveField(record, field))))
+          .join(delimiter),
       );
     }
-    return `${lines.join('\n')}\n`;
-  }
 
-  app.get(
-    '/services/data/:version/jobs/ingest/:id/successfulResults',
-    (req: Request, res: Response) => {
-      const job = jobs.get(String(req.params.id));
-      if (!job) {
-        res.status(404).json(salesforceError('The requested resource does not exist', 'NOT_FOUND'));
-        return;
-      }
-      if (job.state !== 'JobComplete') {
-        res
-          .status(400)
-          .json(
-            salesforceError(
-              `Job is not complete (state=${job.state})`,
-              'INVALIDJOBSTATE',
-            ),
-          );
-        return;
-      }
-      const body = resultsCsv(job, false);
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Sforce-Locator', 'null');
-      res.setHeader('Sforce-NumberOfRecords', String(job.records.length));
-      res.status(200).send(body);
-    },
-  );
+    res.setHeader('Content-Type', `text/csv; charset=utf-8`);
+    res.setHeader('Sforce-Query-Locator', locator ?? 'null');
+    res.setHeader('Sforce-NumberOfRecords', String(page.length));
+    res.setHeader('Access-Control-Expose-Headers', 'Sforce-Query-Locator, Sforce-NumberOfRecords');
+    res.status(200).send(`${lines.join(eol)}${eol}`);
+  });
 
-  app.get(
-    '/services/data/:version/jobs/ingest/:id/failedResults',
-    (req: Request, res: Response) => {
-      const job = jobs.get(String(req.params.id));
-      if (!job) {
-        res.status(404).json(salesforceError('The requested resource does not exist', 'NOT_FOUND'));
-        return;
-      }
-      if (job.state !== 'JobComplete') {
-        res
-          .status(400)
-          .json(salesforceError(`Job is not complete (state=${job.state})`, 'INVALIDJOBSTATE'));
-        return;
-      }
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Sforce-Locator', 'null');
-      res.status(200).send(resultsCsv(job, true));
-    },
-  );
+  // Retired: the mock used to fake query jobs with the *ingest* shape (SOQL
+  // PUT as a "batch", PATCH UploadComplete, successfulResults with
+  // sf__Id/sf__Created). That flow never existed in Salesforce, so it is gone:
+  // ingest jobs are out of scope for this mock and the query-job batch upload
+  // answers 404 rather than silently accepting the wrong shape.
+  const retiredBulkPath = (req: Request, res: Response): void => {
+    res
+      .status(404)
+      .json(
+        salesforceError(
+          `Not implemented by the mock: ${req.method} ${req.originalUrl} ` +
+            '(this mock serves Bulk API 2.0 query jobs only; a query job takes the SOQL in the create body and no batch upload)',
+          'NOT_FOUND',
+        ),
+      );
+  };
+  app.use('/services/data/:version/jobs/ingest', retiredBulkPath);
+  app.use('/services/data/:version/jobs/query/:id/batches', retiredBulkPath);
 
   // ------------------------------------------------------------- SOQL query
 

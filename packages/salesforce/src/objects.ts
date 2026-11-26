@@ -54,7 +54,14 @@ export function fieldsFor(object: SalesforceObjectName): readonly string[] {
   return OBJECT_FIELDS[object];
 }
 
-/** `SELECT <fields> FROM <Object>` — the SOQL text uploaded to the bulk job. */
+/**
+ * `SELECT <fields> FROM <Object>` — the SOQL sent in the **create body** of a
+ * Bulk API 2.0 query job.
+ *
+ * The results CSV header is exactly this field list (no `sf__Id`/`sf__Created`
+ * is added), so `Id` must be in the list or the records cannot be upserted; it
+ * is `Id` when the caller supplies a custom list.
+ */
 export function buildSoql(object: SalesforceObjectName, fields?: readonly string[]): string {
   const selected = (fields && fields.length > 0 ? fields : OBJECT_FIELDS[object]).join(', ');
   return `SELECT ${selected} FROM ${object}`;

@@ -56,6 +56,47 @@ fatal error), `2` unknown mode.
 | `WORKER_FORCE_BULK` | `0` | `1` = always run bulk on `all`, ignoring the freshness window |
 | `WORKER_BULK_SKIP_WINDOW_MS` | `600000` | Freshness window for the restart-loop guard |
 | `WORKER_CDC_JSON` | `0` | `1` = also print a structured `cdc_event` JSON line |
+| `PORT_CONTROL` | `3002` | Port of the control HTTP endpoint (below). Set by `docker-compose.yml`, published as `3002:3002` |
+| `CRM_API_TOKEN` | from compose | Bearer token required by every control route |
+
+## Control endpoint (`PORT_CONTROL`, default 3002)
+
+The worker is normally driven by argv / `WORKER_MODE`, which cannot be triggered
+from another container. `apps/worker/src/control.ts` adds a small **operational
+control plane** so a test, a demo script or an operator can start the two jobs
+over HTTP. It is started in *every* mode (the log line is
+`[control] listening port=3002 mode=all`) and closed on shutdown.
+
+Every route requires `Authorization: Bearer ${CRM_API_TOKEN}` (401 otherwise,
+fail-closed when the token is empty).
+
+| Method | Path | Behaviour |
+|---|---|---|
+| GET | `/health` | `200 { status: 'ok', mode, busy, lastBulkRun }`. `lastBulkRun` is the last bulk run *this process* executed, with `{ syncRunId, status, startedAt, finishedAt, durationMs, totals }`; after a restart it falls back to the newest `bulk_extract` row in `sync_runs` (`durationMs`/`totals` `null`). `busy` is `'bulk'`/`'reconcile'`/`null`. |
+| POST | `/run/bulk` | Runs one Bulk API 2.0 extraction **synchronously** and answers `200` with the full summary: `{ jobId (= syncRunId), kind: 'bulk_extract', status, startedAt, finishedAt, durationMs, totals, objects }`. `500` with the same shape (or an error envelope) when the run reported failures. `409` when another run holds the single-flight lock. |
+| POST | `/run/reconcile` | Runs one reconciliation pass: `200 { jobId, kind: 'reconcile', status, startedAt, finishedAt, durationMs, rows }`, `500` when the report is not clean. |
+
+Synchronous on purpose: a `200` from `POST /run/bulk` means the rows are in
+Postgres, so callers need no second wait/poll protocol. `GET /health` exposes the
+same summary for polling and for dashboards.
+
+```bash
+# what the E2E suite does (apps/web/test/e2e/01-bulk.test.ts)
+curl -s localhost:3002/health -H 'authorization: Bearer poc-local-token'
+curl -s -X POST localhost:3002/run/bulk -H 'authorization: Bearer poc-local-token' \
+  -H 'content-type: application/json' -d '{}'
+curl -s -X POST localhost:3002/run/reconcile -H 'authorization: Bearer poc-local-token'
+```
+
+```
+[control] listening port=3002 mode=all
+[control] bulk run requested
+[bulk] Account read=7 applied=7 skipped_stale=0 ignored=0 errors=0 ms=612
+[control] bulk run e91c8923-… ok read=30 applied=29 skipped_stale=1 errors=0 duration=2501ms
+```
+
+The control server only *triggers* the existing pipelines: the Bulk API client,
+the core upserts and `sync_runs` accounting are the same code paths as the CLI.
 | `DATABASE_URL` | from compose | Postgres (used by `@poc/core`) |
 | `PUBSUB_MIN_BACKOFF_MS` / `PUBSUB_MAX_BACKOFF_MS` | `1000` / `30000` | Reconnect backoff bounds |
 
@@ -125,6 +166,17 @@ docker compose exec -T postgres psql -U poc -d poc_crm \
 
 Emit `"changeType":"DELETE"` with just `{ "Id": … }` to exercise the delete path.
 
+**Pinned timestamps.** `/mock/emit` normally stamps the event with "now" (so
+successive events for one record always move forward). If the emitted `record`
+carries an explicit `SystemModstamp`, the mock keeps it — that is how
+`apps/web/test/e2e/02-cdc.test.ts` publishes an *older* event and proves the
+stale-write guard (`skipped_stale`, row not regressed):
+
+```bash
+curl -s -X POST localhost:4000/mock/emit -H 'content-type: application/json' \
+  -d '{"object":"Opportunity","changeType":"UPDATE","record":{"Id":"006MOCK00001AAAYD2","StageName":"Closed Lost","SystemModstamp":"2024-01-01T00:00:00.000Z"}}'
+```
+
 ## Simulate an interruption (reconnect + replay)
 
 ```bash
@@ -189,6 +241,21 @@ service.
 6. **Idempotent bulk.** Core upserts by the unique `salesforce_id`, so a second
    extraction leaves row counts unchanged.
 
+## Bulk query job wire contract
+
+`packages/salesforce/src/bulk.ts` speaks the real Bulk API 2.0 **query** job
+shape (`docs/CONTRACTS.md` §6 "Bulk query jobs (corrected)"):
+
+```
+POST /services/data/v62.0/jobs/query      { operation:'query', query: SOQL, contentType:'CSV' }  → UploadComplete
+GET  /services/data/v62.0/jobs/query/:id  poll → InProgress → JobComplete
+GET  /services/data/v62.0/jobs/query/:id/results   CSV, paged by Sforce-Query-Locator (?locator=)
+```
+
+There is **no batch upload** (that is ingest-only) and the results CSV header is
+exactly the `SELECT` list — no `sf__Id` / `sf__Created`. Pages of up to 2000 rows
+are concatenated before parsing, so a multi-page result is one record list.
+
 ## Tests
 
 ```bash
@@ -196,8 +263,16 @@ docker compose run --rm tools pnpm exec vitest run apps/worker/test
 docker compose run --rm tools pnpm --filter @poc/worker exec tsc --noEmit
 ```
 
-`apps/worker/test/bulk.test.ts` — real Bulk API 2.0 jobs against the live mock,
-insert + idempotency.
+The end-to-end proof of the control endpoint (and of both pipelines over HTTP)
+lives in `apps/web/test/e2e` — see
+[`apps/web/test/e2e/README.md`](../../web/test/e2e/README.md).
+
+`apps/worker/test/bulk.test.ts` — real Bulk API 2.0 **query** jobs against the
+live mock: the results header equals the `SELECT` list, `Sforce-Query-Locator`
+pages are concatenated, then insert + idempotency.
+`apps/salesforce-mock/src/rest.test.ts` — the mock's own query-job contract
+test (create with the SOQL in the body, no batch upload, header-only CSV for
+zero rows, locator paging, 404 on the retired ingest shape).
 `apps/worker/test/cdc.test.ts` — real gRPC stream, real Avro decode, apply,
 `latency_ms`, stale guard, and checkpoint replay after a stop/restart. Both
 files clean up their own rows (`salesforce_id LIKE '006VITEST%'`, their

@@ -10,9 +10,9 @@
  */
 import { afterAll, describe, expect, it } from 'vitest';
 import { closePool, query, queryOne } from '@poc/core';
-import { extractObject, runBulkExtract } from '@poc/salesforce';
+import { OBJECT_FIELDS, extractObject, runBulkExtract } from '@poc/salesforce';
 
-import { mockState } from './helpers';
+import { mockState, setMockQueryPageJobSize } from './helpers';
 
 const TABLES = ['accounts', 'contacts', 'opportunities', 'leads'] as const;
 type Table = (typeof TABLES)[number];
@@ -56,15 +56,44 @@ describe('bulk extract (mock dataset → Postgres)', () => {
     expect(extracted.object).toBe('Opportunity');
     expect(extracted.records.length).toBeGreaterThan(0);
 
-    // CSV header starts with sf__Id, sf__Created; Owner.Name stays flattened.
-    const [header] = extracted.raw.split('\n');
-    expect(header.startsWith('sf__Id,sf__Created,')).toBe(true);
+    // A query job's CSV header is exactly the SELECT list — no `sf__Id`,
+    // no `sf__Created` (those belong to ingest jobs). `Owner.Name` stays a
+    // single flattened column.
+    const [header] = extracted.raw.split(/\r?\n/);
+    expect(header).not.toContain('sf__');
+    expect(header).toBe(OBJECT_FIELDS.Opportunity.join(','));
     expect(header).toContain('Owner.Name');
 
     const first = extracted.records[0];
     expect(typeof first.Id).toBe('string');
     expect(String(first.Id)).toMatch(/^006/);
     expect(first).toHaveProperty('StageName');
+    // `SystemModstamp` comes back as Salesforce rendered it, and every record
+    // carries exactly the selected columns.
+    expect(String(first.SystemModstamp)).toMatch(/^\d{4}-\d{2}-\d{2}T[\d:.]+[+-]\d{4}$/);
+    expect(Object.keys(first).sort()).toEqual([...OBJECT_FIELDS.Opportunity].sort());
+  });
+
+  it('concatenates every Sforce-Query-Locator page of a query job', async () => {
+    // Shrink the mock's result page so a 4-account query needs several pages.
+    await setMockQueryPageJobSize(2);
+    try {
+      const extracted = await extractObject('Account', undefined);
+      const header = OBJECT_FIELDS.Account.join(',');
+      const lines = extracted.raw.split(/\r?\n/).filter((line) => line !== '');
+
+      // Each page repeats the header; more than one header means the client
+      // followed the locator instead of stopping after the first page.
+      const headerLines = lines.filter((line) => line === header);
+      expect(headerLines.length).toBeGreaterThanOrEqual(2);
+      expect(lines.length - headerLines.length).toBe(extracted.records.length);
+
+      const ids = extracted.records.map((record) => String(record.Id));
+      expect(ids.length).toBeGreaterThanOrEqual(2);
+      expect(new Set(ids).size).toBe(ids.length);
+    } finally {
+      await setMockQueryPageJobSize(2000);
+    }
   });
 
   it('inserts the mock dataset and is idempotent on a second run', async () => {
