@@ -2,22 +2,30 @@
  * `POST /api/leads` — the only public, unauthenticated write endpoint
  * (docs/CONTRACTS.md §5).
  *
- * Flow: rate limit → parse JSON → honeypot → validate → duplicate check →
- * `createLead` from `@poc/core`. All DB access goes through the core service;
- * no SQL here.
+ * Flow: rate limit → parse JSON → honeypot → validate → per-email guard →
+ * atomic find-or-create (`lib/leads/dedupe.ts`).
+ *
+ * Rate limits (see `lib/leads/rate-limit.ts` for the full rationale):
+ *  - 5 submissions / 10 min per IP, when the proxy headers carry a real IP;
+ *  - 60 submissions / 10 min per process for unknown-IP traffic (no proxy);
+ *  - 2 submissions / 10 min per email address — the 3rd is rejected.
  *
  * Never logs or returns the raw email or the message: only a truncated SHA-256
  * of the email for correlation.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { createLead, getLeadByEmail, listLeads, type Lead } from '@poc/core';
-import { check as checkRateLimit, clientIpFromHeaders } from '../../../lib/leads/rate-limit';
+import type { Lead } from '@poc/core';
+import { findOrCreateLandingLead } from '../../../lib/leads/dedupe';
+import {
+  check as checkRateLimit,
+  checkEmail as checkEmailRateLimit,
+  clientIpFromHeaders,
+} from '../../../lib/leads/rate-limit';
 import { honeypotTripped, parseLeadSubmission } from '../../../lib/leads/schema';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
-const DAY_MS = 24 * 60 * 60 * 1000;
 const SOURCE = 'landing_page' as const;
 
 function json(body: unknown, status: number, headers?: Record<string, string>): Response {
@@ -50,30 +58,6 @@ function publicLead(lead: Lead) {
   };
 }
 
-function isRecentLandingPageLead(lead: Lead | null, email: string): lead is Lead {
-  if (!lead) return false;
-  if (lead.source !== SOURCE) return false;
-  if (lead.email.trim().toLowerCase() !== email) return false;
-  const createdAt = Date.parse(lead.created_at);
-  if (Number.isNaN(createdAt)) return false;
-  return Date.now() - createdAt < DAY_MS;
-}
-
-/**
- * Same email + `source='landing_page'` + `created_at` within 24 h.
- * `getLeadByEmail` covers the common case; the fallback search covers the case
- * where a newer lead from another source shadows an older landing-page row
- * (a lead from another source is explicitly NOT a duplicate).
- */
-async function findDuplicate(email: string): Promise<Lead | null> {
-  const direct = await getLeadByEmail(email);
-  if (isRecentLandingPageLead(direct, email)) return direct;
-
-  const since = new Date(Date.now() - DAY_MS).toISOString();
-  const candidates = await listLeads({ search: email, source: SOURCE, created_since: since, limit: 10 });
-  return candidates.data.find((lead) => isRecentLandingPageLead(lead, email)) ?? null;
-}
-
 /** Truncated hash — enough to correlate repeated submissions, useless alone. */
 function hashEmail(email: string): string {
   return createHash('sha256').update(email.trim().toLowerCase()).digest('hex').slice(0, 12);
@@ -84,6 +68,8 @@ type Outcome = 'created' | 'duplicate' | 'invalid' | 'rate_limited' | 'honeypot'
 function logSubmission(fields: {
   outcome: Outcome;
   ip: string;
+  /** Which limiter decided this request: `ip` (proxy header present) or `global` (no proxy). */
+  bucket: 'ip' | 'global' | 'email';
   email?: string;
   leadId?: string | null;
   status: number;
@@ -92,6 +78,7 @@ function logSubmission(fields: {
   const parts = [
     `[leads] submission outcome=${fields.outcome}`,
     `status=${fields.status}`,
+    `bucket=${fields.bucket}`,
     `ip=${fields.ip}`,
     fields.email ? `email_sha256=${hashEmail(fields.email)}` : 'email_sha256=-',
     `lead_id=${fields.leadId ?? '-'}`,
@@ -103,11 +90,18 @@ function logSubmission(fields: {
 export async function POST(request: Request): Promise<Response> {
   const ip = clientIpFromHeaders(request.headers);
 
-  // 1. Rate limit (counts every attempt, including invalid ones).
+  // 1. Rate limit (counts every attempt, including invalid ones). `bucket` is
+  // logged on every outcome: `global` means no proxy header reached us, so the
+  // per-IP limit is not in force and the deployment should get a proxy.
   const limit = checkRateLimit(ip);
+  const bucket = limit.bucket;
   if (!limit.allowed) {
-    logSubmission({ outcome: 'rate_limited', ip, status: 429 });
-    return errorJson('rate_limited', 'Too many submissions from this address. Please try again later.', 429, {
+    logSubmission({ outcome: 'rate_limited', ip, bucket, status: 429 });
+    const message =
+      bucket === 'global'
+        ? 'Too many submissions for this server right now (60 per 10 minutes). Please try again later.'
+        : 'Too many submissions from this address (5 per 10 minutes). Please try again later.';
+    return errorJson('rate_limited', message, 429, {
       headers: { 'retry-after': String(limit.retryAfterSeconds) },
     });
   }
@@ -117,13 +111,13 @@ export async function POST(request: Request): Promise<Response> {
   try {
     body = await request.json();
   } catch {
-    logSubmission({ outcome: 'malformed', ip, status: 400 });
+    logSubmission({ outcome: 'malformed', ip, bucket, status: 400 });
     return errorJson('validation_error', 'Request body must be valid JSON', 400, {
       details: { _: 'Malformed JSON body' },
     });
   }
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
-    logSubmission({ outcome: 'invalid', ip, status: 400 });
+    logSubmission({ outcome: 'invalid', ip, bucket, status: 400 });
     return errorJson('validation_error', 'Request body must be a JSON object', 400, {
       details: { _: 'Expected a JSON object' },
     });
@@ -132,7 +126,7 @@ export async function POST(request: Request): Promise<Response> {
 
   // 3. Honeypot: look successful, store nothing.
   if (honeypotTripped(payload)) {
-    logSubmission({ outcome: 'honeypot', ip, status: 201 });
+    logSubmission({ outcome: 'honeypot', ip, bucket, status: 201 });
     return json(
       {
         data: {
@@ -152,6 +146,7 @@ export async function POST(request: Request): Promise<Response> {
     logSubmission({
       outcome: 'invalid',
       ip,
+      bucket,
       status: 400,
       fields: Object.keys(parsed.fieldErrors),
     });
@@ -161,22 +156,28 @@ export async function POST(request: Request): Promise<Response> {
   }
   const data = parsed.data;
 
-  try {
-    // 5. Duplicate check — 24 h window, landing-page rows only.
-    const duplicate = await findDuplicate(data.email);
-    if (duplicate) {
-      logSubmission({
-        outcome: 'duplicate',
-        ip,
-        email: data.email,
-        leadId: duplicate.id,
-        status: 200,
-      });
-      return json({ data: publicLead(duplicate), duplicate: true }, 200);
-    }
+  // 5. Per-email guard: the 3rd submission for the same address inside the
+  // 10-minute window is rejected even when every visitor looks like `unknown`.
+  const emailLimit = checkEmailRateLimit(data.email);
+  if (!emailLimit.allowed) {
+    logSubmission({
+      outcome: 'rate_limited',
+      ip,
+      bucket: 'email',
+      email: data.email,
+      status: 429,
+    });
+    return errorJson(
+      'rate_limited',
+      'Too many submissions for this email address (2 per 10 minutes). Please try again later.',
+      429,
+      { headers: { 'retry-after': String(emailLimit.retryAfterSeconds) } },
+    );
+  }
 
-    // 6. Create through the core service (source/status/consent_at enforced there).
-    const lead = await createLead({
+  try {
+    // 6. Atomic duplicate check + insert (advisory lock, see lib/leads/dedupe.ts).
+    const { lead, duplicate } = await findOrCreateLandingLead({
       full_name: data.full_name,
       email: data.email,
       phone: data.phone,
@@ -187,7 +188,19 @@ export async function POST(request: Request): Promise<Response> {
       consent: true,
     });
 
-    logSubmission({ outcome: 'created', ip, email: data.email, leadId: lead.id, status: 201 });
+    if (duplicate) {
+      logSubmission({
+        outcome: 'duplicate',
+        ip,
+        bucket,
+        email: data.email,
+        leadId: lead.id,
+        status: 200,
+      });
+      return json({ data: publicLead(lead), duplicate: true }, 200);
+    }
+
+    logSubmission({ outcome: 'created', ip, bucket, email: data.email, leadId: lead.id, status: 201 });
     return json({ data: publicLead(lead) }, 201);
   } catch (error) {
     console.error(

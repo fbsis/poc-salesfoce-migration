@@ -9,11 +9,13 @@
 import { z } from 'zod';
 import {
   AppError,
-  limitSchema,
-  listAccountsParamsSchema,
-  listContactsParamsSchema,
-  listLeadsParamsSchema,
-  listOpportunitiesParamsSchema,
+  MAX_LIMIT,
+  listAccountsParamsSchema as coreListAccountsParamsSchema,
+  listCdcEventsParamsSchema as coreListCdcEventsParamsSchema,
+  listContactsParamsSchema as coreListContactsParamsSchema,
+  listLeadsParamsSchema as coreListLeadsParamsSchema,
+  listOpportunitiesParamsSchema as coreListOpportunitiesParamsSchema,
+  normalizeLimit,
   validate,
 } from '@poc/core';
 
@@ -28,16 +30,8 @@ export {
   createLeadSchema,
   updateLeadSchema,
   updateLeadStatusSchema,
-  // list params
-  listAccountsParamsSchema,
-  listContactsParamsSchema,
-  listOpportunitiesParamsSchema,
-  listLeadsParamsSchema,
-  listCdcEventsParamsSchema,
-  leadSummaryParamsSchema,
   // shared primitives
   idSchema,
-  limitSchema,
   offsetSchema,
   searchSchema,
   entitySourceSchema,
@@ -45,7 +39,37 @@ export {
   leadStatusSchema,
   leadSourceSchema,
   cdcEventStatusSchema,
+  leadSummaryParamsSchema,
 } from '@poc/core';
+
+// ---------------------------------------------------------- limit (clamping)
+
+/**
+ * `limit` for every CRM list endpoint: still an integer ≥ 1 (so `limit=0` and
+ * `limit=abc` remain `400 validation_error`), but anything above the §4 maximum
+ * is **clamped to 200** instead of rejected (AUDIT P2-4) — asking for 500 is a
+ * reasonable request, and `normalizeLimit` already knows how to cap it.
+ */
+export const limitSchema = z
+  .coerce
+  .number()
+  .int()
+  .min(1, 'limit must be at least 1')
+  .transform((value) => normalizeLimit(value))
+  .optional();
+
+/** Exported so tests can assert the clamped value without hard-coding it. */
+export { MAX_LIMIT };
+
+// -------------------------------------------------- list params (clamp limit)
+
+/** Core list params with the clamping `limitSchema` swapped in. */
+export const listAccountsParamsSchema = coreListAccountsParamsSchema.extend({ limit: limitSchema });
+export const listContactsParamsSchema = coreListContactsParamsSchema.extend({ limit: limitSchema });
+export const listOpportunitiesParamsSchema =
+  coreListOpportunitiesParamsSchema.extend({ limit: limitSchema });
+export const listLeadsParamsSchema = coreListLeadsParamsSchema.extend({ limit: limitSchema });
+export const listCdcEventsParamsSchema = coreListCdcEventsParamsSchema.extend({ limit: limitSchema });
 
 // ------------------------------------------------------------ route queries
 
