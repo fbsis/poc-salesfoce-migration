@@ -4,24 +4,35 @@
  * Asserts the two things §7 requires: the mock dataset lands locally with the
  * right shape, and a second run does not duplicate anything.
  *
- * The assertions are written so that the demo `worker` container (which may be
- * running `all` in parallel) cannot make them flaky: they key on the mock's own
- * Salesforce ids instead of raw table totals.
+ * Determinism: this file **owns** the mock dataset it asserts on. It replaces
+ * the mock's rows with `bulkFixture()` in `beforeAll` and then only reads back
+ * ids it created, so (a) no other suite's rows can change the expected counts and
+ * (b) nothing another suite emitted — a demo row edited over CDC to an unmapped
+ * stage, say — can turn the extract into an error. The demo dataset is restored
+ * once per run by `apps/web/test/global-setup.ts`.
  */
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { closePool, query, queryOne } from '@poc/core';
 import { OBJECT_FIELDS, extractObject, runBulkExtract } from '@poc/salesforce';
 
-import { mockState, setMockQueryPageJobSize } from './helpers';
+import {
+  BULK_FIXTURE_COUNTS,
+  BULK_FIXTURE_IDS,
+  BULK_FIXTURE_RECORD_COUNT,
+  BULK_ID_PREFIX,
+  bulkFixture,
+} from './fixtures/bulk-dataset';
+import { mockHealth, setMockQueryPageJobSize, seedMock } from './helpers';
 
 const TABLES = ['accounts', 'contacts', 'opportunities', 'leads'] as const;
 type Table = (typeof TABLES)[number];
 
-const MOCK_PREFIXES: Record<Table, string> = {
-  accounts: '001MOCK',
-  contacts: '003MOCK',
-  opportunities: '006MOCK',
-  leads: '00QMOCK',
+/** Salesforce key prefixes of the fixture ids, per table. */
+const FIXTURE_PREFIXES: Record<Table, string> = {
+  accounts: '001',
+  contacts: '003',
+  opportunities: '006',
+  leads: '00Q',
 };
 
 async function counts(): Promise<Record<Table, number>> {
@@ -39,12 +50,25 @@ function delta(before: Record<Table, number>, after: Record<Table, number>): Rec
   return result;
 }
 
-/** Remove only the mock dataset rows, so the insert can be proven again. */
-async function purgeMockRows(): Promise<void> {
+/**
+ * Remove only this file's rows, so the insert can be proven again.
+ *
+ * Scoped to `VITESTBULK` on purpose: the worker CDC tests create their own
+ * `VITEST…` rows, and a suite must not delete another suite's data either.
+ */
+async function purgeFixtureRows(): Promise<void> {
   for (const table of TABLES) {
-    await query(`DELETE FROM ${table} WHERE salesforce_id LIKE '${MOCK_PREFIXES[table]}%'`);
+    await query(`DELETE FROM ${table} WHERE salesforce_id LIKE $1`, [`${FIXTURE_PREFIXES[table]}${BULK_ID_PREFIX}%`]);
   }
 }
+
+beforeAll(async () => {
+  // Replace the mock dataset: from here on, every record a query job returns is
+  // one this file created. `mode` defaults to `replace` (docs/CONTRACTS.md §6).
+  const seeded = await seedMock(bulkFixture());
+  expect(seeded.counts).toEqual(BULK_FIXTURE_COUNTS);
+  expect((await mockHealth()).dataset).toEqual(BULK_FIXTURE_COUNTS);
+});
 
 afterAll(async () => {
   await closePool();
@@ -54,7 +78,7 @@ describe('bulk extract (mock dataset → Postgres)', () => {
   it('reads every object over a real Bulk API 2.0 query job', async () => {
     const extracted = await extractObject('Opportunity', undefined);
     expect(extracted.object).toBe('Opportunity');
-    expect(extracted.records.length).toBeGreaterThan(0);
+    expect(extracted.records.length).toBe(BULK_FIXTURE_COUNTS.opportunities);
 
     // A query job's CSV header is exactly the SELECT list — no `sf__Id`,
     // no `sf__Created` (those belong to ingest jobs). `Owner.Name` stays a
@@ -89,7 +113,8 @@ describe('bulk extract (mock dataset → Postgres)', () => {
       expect(lines.length - headerLines.length).toBe(extracted.records.length);
 
       const ids = extracted.records.map((record) => String(record.Id));
-      expect(ids.length).toBeGreaterThanOrEqual(2);
+      expect(ids.length).toBe(BULK_FIXTURE_COUNTS.accounts);
+      expect(ids.sort()).toEqual([...BULK_FIXTURE_IDS.accounts].sort());
       expect(new Set(ids).size).toBe(ids.length);
     } finally {
       await setMockQueryPageJobSize(2000);
@@ -97,20 +122,12 @@ describe('bulk extract (mock dataset → Postgres)', () => {
   });
 
   it('inserts the mock dataset and is idempotent on a second run', async () => {
-    const state = await mockState();
-    // Soft-deleted records (IsDeleted) are kept by the mock but excluded from
-    // every SOQL/Bulk result, so only live rows can be expected locally.
-    const live = (rows: Array<Record<string, unknown>>) =>
-      rows.filter((row) => row.IsDeleted !== true).map((row) => String(row.Id));
-    const ids: Record<Table, string[]> = {
-      accounts: live(state.dataset.accounts),
-      contacts: live(state.dataset.contacts),
-      opportunities: live(state.dataset.opportunities),
-      leads: live(state.dataset.leads),
-    };
-    const expectedRead = TABLES.reduce((total, table) => total + ids[table].length, 0);
+    // The fixture is the whole dataset, so this is the exact expected read — no
+    // filtering of "live" rows is needed (the fixture has no deleted records).
+    const expectedRead = BULK_FIXTURE_RECORD_COUNT;
+    const ids = BULK_FIXTURE_IDS;
 
-    await purgeMockRows();
+    await purgeFixtureRows();
     const before = await counts();
 
     const first = await runBulkExtract({ log: () => undefined });
@@ -124,7 +141,7 @@ describe('bulk extract (mock dataset → Postgres)', () => {
       'Lead',
     ]);
 
-    // Every live Salesforce id exists locally, marked as a Salesforce row.
+    // Every fixture id exists locally, marked as a Salesforce row.
     for (const table of TABLES) {
       const row = await queryOne<{ total: number; salesforce: number }>(
         `SELECT count(*)::int AS total,
@@ -136,29 +153,45 @@ describe('bulk extract (mock dataset → Postgres)', () => {
       expect(row?.salesforce).toBe(ids[table].length);
     }
 
-    const skyline = state.dataset.opportunities.find(
-      (row) => row.IsDeleted !== true && String(row.Name).includes('Downtown tower'),
+    // The mapping is asserted against the fixture, not against the mock's
+    // current state: the values are known here, so nothing can drift.
+    const mapped = await queryOne<{ stage: string; amount: string; owner_name: string | null }>(
+      `SELECT stage, amount, owner_name FROM opportunities WHERE salesforce_id = $1`,
+      [ids.opportunities[0]],
     );
-    if (skyline) {
-      const row = await queryOne<{ stage: string; amount: string; owner_name: string | null }>(
-        `SELECT stage, amount, owner_name FROM opportunities WHERE salesforce_id = $1`,
-        [String(skyline.Id)],
-      );
-      // Data-driven: the mock dataset may have been changed by a demo or a CDC
-      // event, so compare against the mock's *current* value.
-      expect(row?.stage).toBe(String(skyline.StageName));
-      expect(Number(row?.amount)).toBe(Number(skyline.Amount));
-      // `Owner.Name` arrives as a flattened CSV column and maps to owner_name.
-      expect(row?.owner_name).toBe('Dana Whitfield');
-    }
+    expect(mapped?.stage).toBe('Prospecting');
+    expect(Number(mapped?.amount)).toBe(120_000);
+    // `Owner.Name` arrives as a flattened CSV column and maps to owner_name.
+    expect(mapped?.owner_name).toBe('Dana Whitfield');
+
+    // The run recorded its own `sync_runs` row with the same numbers.
+    const recorded = await queryOne<{
+      kind: string;
+      status: string;
+      records_read: number;
+      records_written: number;
+      error: string | null;
+    }>(
+      `SELECT kind, status, records_read, records_written, error FROM sync_runs WHERE id = $1`,
+      [first.syncRunId],
+    );
+    expect(recorded?.kind).toBe('bulk_extract');
+    expect(recorded?.status).toBe('success');
+    expect(recorded?.records_read).toBe(expectedRead);
+    expect(recorded?.records_written).toBe(expectedRead);
+    expect(recorded?.error).toBeNull();
+
+    // Row counts only ever moved by exactly the rows this file purged + inserted.
+    const afterFirst = await counts();
+    expect(delta(before, afterFirst)).toEqual({ ...BULK_FIXTURE_COUNTS });
 
     // -------- second run: nothing new, nothing duplicated -------------------
-    const afterFirst = await counts();
     const second = await runBulkExtract({ log: () => undefined });
     const afterSecond = await counts();
 
     expect(second.totals.errors).toBe(0);
     expect(second.totals.read).toBe(expectedRead);
+    expect(second.totals.applied).toBe(expectedRead);
     expect(delta(afterFirst, afterSecond)).toEqual({
       accounts: 0,
       contacts: 0,
@@ -166,7 +199,14 @@ describe('bulk extract (mock dataset → Postgres)', () => {
       leads: 0,
     });
     expect(second.syncRunId).not.toBe(first.syncRunId);
-    // Row counts only ever moved because of *our* purge + insert.
-    expect(before.accounts).toBeLessThanOrEqual(afterFirst.accounts);
+
+    // …and one row per id, not two.
+    for (const table of TABLES) {
+      const row = await queryOne<{ total: number }>(
+        `SELECT count(*)::int AS total FROM ${table} WHERE salesforce_id = ANY($1::text[])`,
+        [ids[table]],
+      );
+      expect(row?.total).toBe(ids[table].length);
+    }
   });
 });

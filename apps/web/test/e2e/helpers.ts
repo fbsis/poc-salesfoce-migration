@@ -14,15 +14,20 @@
  * Determinism rules:
  *  - every id/email carries a per-process `RUN` marker (`E2E<6 hex>`), so two
  *    runs never collide and each file can be executed on its own;
- *  - the mock dataset is *extended*, never replaced: the demo rows are read
- *    back from `/mock/state` and seeded again next to the E2E rows;
- *  - `cleanupE2EData()` removes only rows matching this run's marker and then
- *    restores the mock to its demo-only dataset. The demo data is never
- *    touched and `/mock/reset` is never called.
+ *  - each file starts by **replacing** the mock dataset with the canonical demo
+ *    rows plus its own E2E rows (`prepareE2EDataset`), so the counts a file
+ *    asserts on never depend on what an earlier file left behind — nothing the
+ *    suite asserts on is inherited from another suite;
+ *  - `cleanupE2EData()` removes only rows matching the suite's markers and puts
+ *    the mock back to the demo-only dataset. Demo rows are never mutated, and
+ *    the final `POST /mock/reset` + canonical re-seed happens once per run in
+ *    `apps/web/test/global-setup.ts` (vitest `globalSetup`).
  */
 import { randomBytes } from 'node:crypto';
 
 import { query, type CdcEvent } from '@poc/core';
+
+import { TEST_LEAD_EMAIL_PATTERN, canonicalDataset } from '../fixtures/canonical';
 
 // --------------------------------------------------------------- endpoints
 
@@ -225,12 +230,26 @@ export function mockHealth(): Promise<{
   return mockJson('/mock/health');
 }
 
-/** Replaces the whole mock dataset — callers must pass the demo rows plus theirs. */
-export function seedMock(dataset: Partial<MockDataset>): Promise<{ ok: boolean; counts: MockCounts }> {
-  return mockJson('/mock/seed', { method: 'POST', body: JSON.stringify(dataset) });
+export interface SeedOptions {
+  /**
+   * `replace` (default) makes the seeded dataset the whole dataset;
+   * `merge` upserts into whatever the mock already holds.
+   */
+  mode?: 'replace' | 'merge';
 }
 
-/** Admin reset. The E2E suite intentionally never calls this at the end. */
+/** Seed the mock. `POST /mock/seed` replaces by default (docs/CONTRACTS.md §6). */
+export function seedMock(
+  dataset: Partial<MockDataset>,
+  options: SeedOptions = {},
+): Promise<{ ok: boolean; mode: string; counts: MockCounts }> {
+  return mockJson('/mock/seed', {
+    method: 'POST',
+    body: JSON.stringify({ ...dataset, mode: options.mode ?? 'replace' }),
+  });
+}
+
+/** Admin reset: empty dataset, empty event log. Restores nothing by itself. */
 export function resetMock(): Promise<{ ok: boolean; counts: MockCounts; events: number }> {
   return mockJson('/mock/reset', { method: 'POST', body: '{}' });
 }
@@ -641,58 +660,67 @@ export function isE2ERecord(row: unknown): boolean {
   return new RegExp(E2E_ID_REGEX).test(id);
 }
 
-function withoutE2ERows(rows: SfRecord[] | undefined): SfRecord[] {
-  return (rows ?? []).filter((row) => !isE2ERecord(row));
-}
-
 /**
- * Seeds the E2E objects *next to* the live demo dataset.
+ * Seeds the canonical demo dataset **plus** this run's E2E records, replacing
+ * whatever the mock held.
  *
- * `/mock/seed` replaces everything, so the current demo rows are read back from
- * `/mock/state` first and seeded again unchanged. Re-running this (a second
- * test file, a second suite run) is safe: any previous E2E rows are dropped and
- * replaced by pristine copies stamped "now", which keeps the bulk extract's
- * stale-write guard from skipping them.
+ * This is the dataset every assertion in `01-bulk.test.ts` and `02-cdc.test.ts`
+ * is written against: 19 demo rows + 11 E2E rows, all known here. Reading the
+ * current rows back from `/mock/state` (the previous approach) made the counts
+ * depend on whatever an earlier suite — or an interrupted run — had emitted into
+ * the mock, which is exactly the non-determinism this file must not have.
+ * The demo rows are re-seeded from the canonical fixture unchanged, so no demo
+ * data is lost either.
  */
 export async function prepareE2EDataset(): Promise<E2EDataset> {
   const dataset = buildE2EDataset();
-  const state = await mockState();
-  await seedMock({
-    accounts: [...withoutE2ERows(state.dataset.accounts), ...dataset.accounts],
-    contacts: [...withoutE2ERows(state.dataset.contacts), ...dataset.contacts],
-    opportunities: [...withoutE2ERows(state.dataset.opportunities), ...dataset.opportunities],
-    leads: [...withoutE2ERows(state.dataset.leads), ...dataset.leads],
+  const canonical = canonicalDataset();
+  const counts = await seedMock({
+    accounts: [...canonical.accounts, ...dataset.accounts],
+    contacts: [...canonical.contacts, ...dataset.contacts],
+    opportunities: [...canonical.opportunities, ...dataset.opportunities],
+    leads: [...canonical.leads, ...dataset.leads],
   });
+  // Fail loudly here rather than with a confusing count assertion later.
+  const expected = {
+    accounts: canonical.accounts.length + dataset.accounts.length,
+    contacts: canonical.contacts.length + dataset.contacts.length,
+    opportunities: canonical.opportunities.length + dataset.opportunities.length,
+    leads: canonical.leads.length + dataset.leads.length,
+  };
+  const objects = ['accounts', 'contacts', 'opportunities', 'leads'] as const;
+  for (const object of objects) {
+    if (counts.counts[object] !== expected[object]) {
+      throw new Error(
+        `prepareE2EDataset: mock holds ${counts.counts[object]} ${object}, expected ${expected[object]}`,
+      );
+    }
+  }
   return dataset;
 }
 
-/** Restores the mock dataset to the demo rows only (E2E rows dropped). */
+/**
+ * Puts the mock back to the demo-only dataset (canonical rows, replace mode).
+ * Safe to call after any file: test rows this run created are dropped with the
+ * rest of what was there, and the demo rows come from the canonical fixture.
+ */
 export async function restoreMockDataset(): Promise<void> {
-  const state = await mockState();
-  await seedMock({
-    accounts: withoutE2ERows(state.dataset.accounts),
-    contacts: withoutE2ERows(state.dataset.contacts),
-    opportunities: withoutE2ERows(state.dataset.opportunities),
-    leads: withoutE2ERows(state.dataset.leads),
-  });
+  await seedMock(canonicalDataset());
 }
 
 /**
  * Removes every E2E row (this run's, plus any orphaned by an interrupted run)
  * and restores the mock to its demo dataset. Only fixture rows are matched by
- * id shape / email prefix; demo data is never touched and `/mock/reset` is never
- * called.
+ * id shape / email prefix; demo data is never touched.
  */
 export async function cleanupE2EData(): Promise<void> {
-  const emailPattern = 'e2e-%@example.test';
-
   await query(`DELETE FROM cdc_events WHERE record_id ~ $1`, [E2E_ID_REGEX]);
   await query(`DELETE FROM sf_orphan_links WHERE account_salesforce_id ~ $1`, [E2E_ID_REGEX]);
   await query(`DELETE FROM opportunities WHERE salesforce_id ~ $1`, [E2E_ID_REGEX]);
   await query(`DELETE FROM contacts WHERE salesforce_id ~ $1`, [E2E_ID_REGEX]);
   await query(`DELETE FROM leads WHERE salesforce_id ~ $1 OR lower(email) LIKE $2`, [
     E2E_ID_REGEX,
-    emailPattern,
+    TEST_LEAD_EMAIL_PATTERN,
   ]);
   await query(`DELETE FROM accounts WHERE salesforce_id ~ $1`, [E2E_ID_REGEX]);
   // Garbage-collect links whose local row no longer exists (created by a run

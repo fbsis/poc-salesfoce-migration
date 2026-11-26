@@ -11,6 +11,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Account, Contact, Lead, Opportunity, SyncRun } from '@poc/core';
 
+import { CANONICAL_COUNTS } from '../fixtures/canonical';
 import {
   RUN,
   apiJson,
@@ -45,6 +46,18 @@ interface BulkTotals {
 
 const TABLE_PATHS = ['accounts', 'contacts', 'opportunities', 'leads'] as const;
 
+/** Rows this file seeds (3 accounts, 3 contacts, 3 opportunities, 2 leads). */
+const OWN_COUNTS = { accounts: 3, contacts: 3, opportunities: 3, leads: 2 } as const;
+const OWN_RECORD_COUNT = OWN_COUNTS.accounts + OWN_COUNTS.contacts + OWN_COUNTS.opportunities + OWN_COUNTS.leads;
+
+/** The mock after `prepareE2EDataset`: the 19 canonical demo rows + our 11. */
+const SEEDED_COUNTS = {
+  accounts: CANONICAL_COUNTS.accounts + OWN_COUNTS.accounts,
+  contacts: CANONICAL_COUNTS.contacts + OWN_COUNTS.contacts,
+  opportunities: CANONICAL_COUNTS.opportunities + OWN_COUNTS.opportunities,
+  leads: CANONICAL_COUNTS.leads + OWN_COUNTS.leads,
+} as const;
+
 describe(
   'Capability 1 — Salesforce records are imported into the internal CRM (Bulk API 2.0)',
   { timeout: 60_000 },
@@ -52,9 +65,15 @@ describe(
     let ids: E2EIds;
     /** Totals per object before the first run of the file. */
     let baseline: Record<(typeof TABLE_PATHS)[number], number>;
+    /** The dataset this file asserts on: 19 canonical demo rows + our 11. */
+    let seededCounts: Record<(typeof TABLE_PATHS)[number], number>;
 
     beforeAll(async () => {
       ids = e2eIds(await prepareE2EDataset());
+      // `prepareE2EDataset` *replaces* the mock dataset, so these counts are the
+      // whole truth for this file: nothing another suite emitted can be here.
+      seededCounts = liveCounts((await mockState()).dataset);
+      expect(seededCounts).toEqual(SEEDED_COUNTS);
       baseline = await totals();
     });
 
@@ -82,11 +101,12 @@ describe(
       const snapshot = await mockState();
       const expectedRead = liveRecordCount(snapshot.dataset);
       const expectedCounts = liveCounts(snapshot.dataset);
-      // The mock holds the demo dataset *plus* this run's 11 objects.
-      expect(expectedCounts.accounts).toBeGreaterThanOrEqual(3);
-      expect(expectedCounts.contacts).toBeGreaterThanOrEqual(3);
-      expect(expectedCounts.opportunities).toBeGreaterThanOrEqual(3);
-      expect(expectedCounts.leads).toBeGreaterThanOrEqual(2);
+      // Exactly the canonical demo dataset plus this run's 11 objects — asserted
+      // as an equality, not a lower bound: the dataset is owned by this file.
+      expect(expectedCounts).toEqual(SEEDED_COUNTS);
+      expect(expectedRead).toBe(
+        SEEDED_COUNTS.accounts + SEEDED_COUNTS.contacts + SEEDED_COUNTS.opportunities + SEEDED_COUNTS.leads,
+      );
 
       const run = await bulkRun();
 
@@ -101,7 +121,11 @@ describe(
       // its job — the 11 E2E rows below are all applied, which is asserted by
       // reading each one back with its seeded values.
       expect(run.totals.applied + run.totals.skipped_stale + run.totals.ignored).toBe(expectedRead);
-      expect(run.totals.applied).toBeGreaterThanOrEqual(11);
+      // Our own rows are new (this run's ids, purged with the E2E cleanup), so
+      // they can never be skipped as stale; only *demo* rows can be, and there
+      // are only `expectedRead - OWN_RECORD_COUNT` of those.
+      expect(run.totals.applied).toBeGreaterThanOrEqual(OWN_RECORD_COUNT);
+      expect(run.totals.skipped_stale).toBeLessThanOrEqual(expectedRead - OWN_RECORD_COUNT);
       expect(run.totals.ignored).toBe(0);
       expect(run.objects.map((entry) => entry.object)).toEqual([
         'Account',

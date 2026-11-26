@@ -50,14 +50,20 @@ rows through `@poc/core` (the CRM API deliberately exposes no deletes).
   (`RUN` in `helpers.ts`), so two runs never collide and the same suite can run
   twice in a row. `e2eId()` throws rather than silently truncating two ids to
   the same 15-char Salesforce base.
-* **Order independence.** Each file prepares what it needs (`prepareE2EDataset`
-  re-seeds pristine, freshly-stamped E2E rows next to the live demo rows) and
-  cleans up after itself. Files are not required to run in numeric order; the
-  root config uses `singleFork`, so they never overlap.
-* **The demo data is never touched.** `/mock/reset` is never called. The mock's
-  demo dataset is read from `/mock/state` and seeded again unchanged next to the
-  E2E rows (`/mock/seed` replaces the dataset, so it is always passed as
-  "current demo rows + this run's rows"). `afterAll` deletes only rows matching
+* **Order independence.** Each file prepares what it needs and cleans up after
+  itself: `prepareE2EDataset()` **replaces** the mock dataset with the canonical
+  demo rows (`apps/web/test/fixtures/canonical.ts`) plus freshly-stamped E2E
+  rows, so the counts a file asserts on never depend on what an earlier file (or
+  an earlier, interrupted run) left in the shared mock. Files are not required to
+  run in numeric order; the root config uses `singleFork`, so they never overlap.
+* **The demo data is never mutated.** No test edits a demo row: E2E rows are the
+  only rows the files read back and change. `/mock/reset` is not called per file
+  (the canonical rows are re-seeded instead); it is called exactly once for the
+  whole run — together with a canonical re-seed, a truncation of the CRM's
+  Salesforce mirror, one bulk extract and a purge of every `E2E`/`VITEST`/`TEST`
+  row and its `cdc_events` — by `apps/web/test/global-setup.ts` (vitest
+  `globalSetup`). `pnpm test` therefore leaves the demo exactly as
+  `docs/DEMO.md` documents it. `afterAll` in each file deletes only rows matching
   the run marker / run-scoped email prefix and restores the mock to demo-only.
 * **Timeouts.** Each capability is one `describe` with a 60 s timeout
   (`describe(name, { timeout: 60_000 })`), and every wait is an explicit

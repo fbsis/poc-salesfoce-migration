@@ -265,11 +265,29 @@ export class SalesforceStore {
     };
   }
 
-  /** Replace the whole dataset (missing objects become empty). */
+  /**
+   * Replace the whole dataset (missing objects become empty).
+   *
+   * `POST /mock/seed` uses this by default: the endpoint is the demo reset, so
+   * a seeded dataset is a *snapshot*, never an increment. Merging used to be
+   * implicit and made every count depend on what the previous caller had left
+   * behind (P2-2); callers that really want to add rows ask for it explicitly
+   * with `{"mode":"merge"}` (see §6 in docs/CONTRACTS.md).
+   */
   replaceAll(input: DatasetInput): DatasetCounts {
+    for (const object of SF_OBJECTS) this.records[object] = new Map();
+    return this.mergeAll(input);
+  }
+
+  /**
+   * Upsert rows into the current dataset; objects that are not mentioned keep
+   * their current rows. A row with an existing `Id` is overwritten wholesale
+   * (it is the new snapshot of that record, not a field-level patch).
+   */
+  mergeAll(input: DatasetInput): DatasetCounts {
     for (const object of SF_OBJECTS) {
       const rows = input[object] ?? [];
-      const map = new Map<string, SfRecord>();
+      const map = this.records[object];
       for (const row of rows) {
         if (!row || typeof row !== 'object') continue;
         const normalized = normalizeRecord(object, row as Record<string, unknown>);
@@ -279,7 +297,6 @@ export class SalesforceStore {
         if (typeof normalized.IsDeleted !== 'boolean') normalized.IsDeleted = false;
         map.set(id, normalized);
       }
-      this.records[object] = map;
     }
     return this.counts();
   }

@@ -74,6 +74,35 @@ export async function mockState(): Promise<MockState> {
   return mockJson<MockState>('/mock/state');
 }
 
+export interface SeedOptions {
+  /**
+   * `replace` (default) makes the supplied rows the whole dataset — a suite that
+   * asserts on counts wants this; `merge` upserts into the current dataset.
+   */
+  mode?: 'replace' | 'merge';
+}
+
+/**
+ * `POST /mock/seed` — replaces the mock dataset by default (docs/CONTRACTS.md
+ * §6). A suite must seed exactly the dataset it asserts on: the mock is shared
+ * with every other suite and with the running demo worker, so “whatever is in
+ * there” is never a fixture.
+ */
+export async function seedMock(
+  dataset: Partial<MockDataset>,
+  options: SeedOptions = {},
+): Promise<{ counts: MockState['counts']; mode: string }> {
+  return mockJson('/mock/seed', {
+    method: 'POST',
+    body: JSON.stringify({ ...dataset, mode: options.mode ?? 'replace' }),
+  });
+}
+
+/** `POST /mock/reset` — clears dataset + event log. */
+export async function resetMock(): Promise<{ counts: MockState['counts']; events: number }> {
+  return mockJson('/mock/reset', { method: 'POST', body: '{}' });
+}
+
 /** POST /mock/emit — publishes a real Avro CDC event over the real gRPC stream. */
 export async function emitChange(input: {
   object: string;

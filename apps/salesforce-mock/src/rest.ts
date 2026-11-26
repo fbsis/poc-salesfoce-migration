@@ -38,6 +38,7 @@ import {
   parseSfDate,
   toSfDateTime,
   toObjectName,
+  type DatasetInput,
   type SfObject,
   type SfRecord,
   type SalesforceStore,
@@ -479,6 +480,8 @@ const seedBodySchema = z
     contacts: z.array(z.record(z.unknown())).optional(),
     opportunities: z.array(z.record(z.unknown())).optional(),
     leads: z.array(z.record(z.unknown())).optional(),
+    /** `replace` (default) makes the seeded dataset a snapshot; `merge` adds. */
+    mode: z.enum(['replace', 'merge']).optional(),
   })
   .passthrough();
 
@@ -584,13 +587,18 @@ export function createRestApp(options: RestAppOptions): Express {
       return;
     }
     const body = parsed.data;
-    const counts = store.replaceAll({
+    const mode = body.mode ?? 'replace';
+    const input: DatasetInput = {
       Account: body.accounts as SfRecord[] | undefined,
       Contact: body.contacts as SfRecord[] | undefined,
       Opportunity: body.opportunities as SfRecord[] | undefined,
       Lead: body.leads as SfRecord[] | undefined,
-    });
-    res.json({ ok: true, counts });
+    };
+    // `replace` (the default) is the deterministic demo/test reset: the store
+    // holds exactly the supplied rows afterwards. `merge` keeps the current
+    // rows and upserts the supplied ones, for callers that add to a dataset.
+    const counts = mode === 'merge' ? store.mergeAll(input) : store.replaceAll(input);
+    res.json({ ok: true, mode, counts });
   });
 
   app.get('/mock/state', (_req: Request, res: Response) => {

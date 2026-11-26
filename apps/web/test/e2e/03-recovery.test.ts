@@ -117,7 +117,10 @@ describe(
       const events = await poll(
         async () => {
           const rows = (await cdcEvents()).filter((event) => ids.includes(event.record_id));
-          return rows.length === 2 ? rows : null;
+          // `pending` is written before the apply runs; wait for the terminal
+          // status instead of reading a row that is still being applied.
+          if (rows.length !== 2 || rows.some((event) => event.status === 'pending')) return null;
+          return rows;
         },
         { timeout: RECOVERY_TIMEOUT, interval: 200, label: 'two cdc_events rows for the replayed ids' },
       );

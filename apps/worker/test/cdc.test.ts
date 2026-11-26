@@ -60,17 +60,32 @@ async function waitForStage(salesforceId: string, stage: string, timeoutMs = 10_
   );
 }
 
-/** Wait until this consumer's own channel has logged `count` events. */
-async function waitForEventCount(channel: string, count: number, timeoutMs = 10_000) {
+/**
+ * Wait until this consumer's own channel has logged `count` events **and every
+ * one of them reached a terminal status**.
+ *
+ * The `pending` row is inserted before the apply runs, so waiting only for the
+ * count races the apply: the assertions below read `status`/`latency_ms`, which
+ * are written when the apply finishes. Waiting for a settled log is not a
+ * weaker assertion — it is the same one, without reading a row mid-transition.
+ */
+async function waitForSettledEvents<T extends { status: string }>(
+  channel: string,
+  count: number,
+  timeoutMs = 10_000,
+): Promise<T[]> {
   return waitFor(
     async () => {
-      const row = await queryOne<{ total: number }>(
-        `SELECT count(*)::int AS total FROM cdc_events WHERE channel = $1`,
+      const rows = await query<T>(
+        `SELECT event_id, change_type, status, latency_ms
+           FROM cdc_events WHERE channel = $1 ORDER BY id`,
         [channel],
       );
-      return (row?.total ?? 0) >= count ? (row?.total ?? 0) : null;
+      if (rows.length < count) return null;
+      if (rows.some((row) => row.status === 'pending')) return null;
+      return rows;
     },
-    { timeoutMs, label: `${channel} → ${count} events` },
+    { timeoutMs, label: `${channel} → ${count} settled events` },
   );
 }
 
@@ -168,21 +183,16 @@ describe('CDC (Pub/Sub gRPC + Avro)', () => {
 
       // The row may also be written by the demo worker container; wait for this
       // consumer's own bookkeeping before asserting the row and the log.
-      await waitForEventCount(channel, 2);
-      const row = await waitForStage(id, 'Negotiation');
-      expect(Number(row.amount)).toBe(15000);
-      expect(row.name).toBe('Vitest cdc apply');
-
-      const events = await query<{
+      const events = await waitForSettledEvents<{
         event_id: string;
         change_type: string;
         status: string;
         latency_ms: number | null;
-      }>(
-        `SELECT event_id, change_type, status, latency_ms
-           FROM cdc_events WHERE channel = $1 ORDER BY id`,
-        [channel],
-      );
+      }>(channel, 2);
+      const row = await waitForStage(id, 'Negotiation');
+      expect(Number(row.amount)).toBe(15000);
+      expect(row.name).toBe('Vitest cdc apply');
+
       expect(events).toHaveLength(2);
       expect(events.map((event) => event.change_type)).toEqual(['CREATE', 'UPDATE']);
       for (const event of events) {
@@ -192,7 +202,13 @@ describe('CDC (Pub/Sub gRPC + Avro)', () => {
         // applied, and nothing is ever written twice.
         expect(['applied', 'skipped_stale']).toContain(event.status);
         expect(event.latency_ms).not.toBeNull();
-        expect(Number(event.latency_ms)).toBeGreaterThan(0);
+        // `latency_ms = now - ChangeEventHeader.commitTimestamp` in whole ms, so
+        // a warm stack that applies the event in the same millisecond records 0
+        // (the mock's commitTimestamp is strictly increasing and can even be a
+        // little ahead of wall-clock). What matters is that it is measured and
+        // bounded; capability 3 in apps/web/test/e2e proves a positive value on
+        // events that had to wait for a replay.
+        expect(Number(event.latency_ms)).toBeGreaterThanOrEqual(0);
         expect(Number(event.latency_ms)).toBeLessThan(30_000);
         expect(event.event_id.startsWith(`${channel}:`)).toBe(true);
       }
@@ -234,7 +250,9 @@ describe('CDC (Pub/Sub gRPC + Avro)', () => {
               WHERE channel = $1 AND record_id = $2 AND change_type = 'UPDATE'`,
             [channel, id],
           );
-          return row ?? null;
+          // `pending` means the apply has not finished yet: wait for it instead
+          // of asserting on a row that is still being written.
+          return row && row.status !== 'pending' ? row : null;
         },
         { timeoutMs: 10_000, label: 'stale event recorded' },
       );
@@ -303,7 +321,7 @@ describe('CDC (Pub/Sub gRPC + Avro)', () => {
       await second.ready();
       const row = await waitForStage(id, 'Proposal');
       expect(Number(row.amount)).toBe(3000);
-      await waitForEventCount(channel, 3);
+      await waitForSettledEvents(channel, 3);
       expect(logs.some((line) => line.includes('preset=CUSTOM'))).toBe(true);
     } finally {
       await second.stop();

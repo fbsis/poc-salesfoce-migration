@@ -367,7 +367,7 @@ Admin (no auth, test/demo only):
 
 | Method | Path | Behaviour |
 |---|---|---|
-| POST | `/mock/seed` | `{ accounts?, contacts?, opportunities?, leads? }` (Salesforce-shaped, `Id` like `001…`) → replaces dataset, returns counts |
+| POST | `/mock/seed` | `{ accounts?, contacts?, opportunities?, leads?, mode? }` (Salesforce-shaped, `Id` like `001…`) → replaces the dataset by default (`{"mode":"merge"}` adds/overwrites rows instead), returns counts |
 | GET | `/mock/state` | current dataset + emitted event log |
 | POST | `/mock/reset` | clears dataset + event log |
 | POST | `/mock/emit` | `{ object, changeType, record }` → publishes a CDC event to all subscribers of that topic (deferred until a subscriber is attached; queue it) |
