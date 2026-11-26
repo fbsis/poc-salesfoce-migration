@@ -1,6 +1,6 @@
 # Architecture
 
-How the POC is put together, and why. Written against commit `9175ff3`; every path below exists and
+How the POC is put together, and why. Written against commit `ac527fc`; every path below exists and
 every claim is traceable to code or to a command in this repo. Open defects referenced here are
 catalogued in [`FINDINGS.md`](FINDINGS.md) §3.
 
@@ -88,8 +88,9 @@ RETURNING id
 timestamp may only INSERT: on conflict it is rejected as `ignored` / `reason: 'missing timestamp'`,
 and neither its data nor its stamp is touched. DELETE uses the same comparison in its `WHERE` when
 the caller passes the event timestamp (`deleteSalesforceRecord(object, id, { updatedAt })`). **The
-CDC consumer does not pass it** (open finding P1-2, `FINDINGS.md` §3), so the DELETE path is
-guarded in capability but unguarded in practice.
+CDC consumer does not pass it** (`cdc.ts:976` calls it with two arguments; so does the redrive helper
+at `redrive.ts:99` — open finding P1-2, `FINDINGS.md` §3), so the DELETE path is guarded in
+capability but unguarded in practice.
 
 Why in SQL rather than in application code:
 
@@ -137,19 +138,34 @@ One `subscribeOnce` loop per topic (`packages/salesforce/src/cdc.ts`), four topi
 with its own queue so per-record ordering is preserved within a topic.
 
 ```text
-startup:  getCheckpoint(topic)
+startup:  CdcConsumer.reapOrphanSyncRuns()      close stale kind='cdc' running rows as failed
+          startSyncRun('cdc', …)                one run per consumer lifetime
+          getCheckpoint(topic)
           replay_id known → Subscribe{replayPreset: CUSTOM, replayId, numRequested:100}
           else            → Subscribe{replayPreset: LATEST}
 per event:
           decode Avro(payload) → ChangeEventHeader
           eventId = '<channel>:<replayId>'
-          recordCdcEvent(...)            ON CONFLICT (event_id) DO NOTHING  → duplicate?
-          duplicate → advance checkpoint, count, done
-          DELETE    → deleteSalesforceRecord(object, id, {updatedAt})
+          blockedAt set and replayId > blockedAt → drop, not recorded (stats.held), wait for replay
+          recordCdcEvent(...)            ON CONFLICT (event_id) DO NOTHING
+          duplicate + stored row is NOT 'failed' → advance checkpoint, count, done
+          DELETE    → deleteSalesforceRecord(object, id)          ← no timestamp (P1-2)
           otherwise → applySalesforceRecord(object, changeType, record)
-          markCdcEventProcessed(eventId, outcome)
+          apply throws → retry 3× (250 ms / 1 s / 3 s)
+          still failing → cdc_events='failed' (payload + error kept)
+                          cdc_checkpoints.status='error', replay_id UNCHANGED
+                          [cdc][ALERT] · cancel this topic's stream · blockedAt = replayId
+          applied  → markCdcEventProcessed(eventId, outcome)
           advanceCheckpoint(topic, replayId)   ← only if replayId > highest saved
 stream error: exponential backoff 1s → 30s with jitter, resubscribe from the checkpoint
+operator:     POST :3002/run/redrive → redriveFailedEvents(): re-apply failed rows, oldest first
+              POST :3002/run/discard {event_ids:[…]} → discardFailedEvents(): 'ignored' + move
+                  that channel's checkpoint past them (the record is NOT applied)
+reconnect:    re-reads failed rows for the channel → block derived from the DB, not memory
+              rows remain → checkpoint stays status='error' (incident stays visible)
+              none remain → '[cdc] … unblocked (no failed events remain at …), resuming'
+                            + checkpoint back to 'connected'
+stop:         closeSyncRun('consumer stopped')   (or 'disconnected' after 30 s with every topic down)
 ```
 
 Latency is `Date.now() − ChangeEventHeader.commitTimestamp`, stored per event in
@@ -161,20 +177,43 @@ mock queues events published with no subscriber (`"queued":true`), the worker re
 `preset=CUSTOM` from `cdc_checkpoints.replay_id` and receives everything after that id. Duplicate
 delivery is harmless because `event_id` is unique.
 
-**Failure path — currently at-most-once (open defect P0-2).** When the apply throws, the consumer
-marks the event `failed`, **still advances the checkpoint**, and nothing ever re-applies
-`cdc_events.status='failed'`. A replay of the same replay id is caught by the dedupe and skipped. So
-a poison event is dropped, silently, while the dashboard reports `failed: 0` (there simply is
-nothing in that state). This is the committed behaviour at `9175ff3`.
+**Failure path — bounded retry, then head-of-line blocking (P0-2, fixed in `2ffb827`).** An apply
+that throws is retried 3× in-process; transient blips (deadlock, pool timeout, a slow
+`linkOrphanRecords`) recover silently. If all three attempts fail the event is dead-lettered **and
+the checkpoint is held**: `cdc_events.status='failed'` keeps the payload and the error,
+`cdc_checkpoints` moves to `status='error'` while keeping its `replay_id`, `[cdc][ALERT]` is printed,
+and that topic's stream is cancelled so the reconnect re-subscribes from the same checkpoint. Events
+behind the blocked replay id are dropped *unrecorded* and re-fetched by the replay, so the checkpoint
+can never jump over the hole.
 
-> **In flight, uncommitted (as of 2026-11-26T00:50Z):** a rewrite of `cdc.ts` (+465 lines) plus
-> `packages/salesforce/src/redrive.ts` replaces this with bounded in-process retry (3 attempts,
-> 250 ms / 1 s / 3 s), dead-lettering **without** advancing the checkpoint, deliberate head-of-line
-> blocking of that topic (`stats.blocked` / `stats.held`), a `[cdc][ALERT]` line, a `cdc` row in
-> `sync_runs` with latency p50/max, and an operator redrive `POST /run/redrive` on the worker
-> control plane. Its new test file `apps/worker/test/cdc-run.test.ts` **was failing** when this was
-> written (3 of 7 tests), so treat it as work in progress, not as delivered behaviour. See
-> `FINDINGS.md` §3.
+That is **deliberate head-of-line blocking**: the other three topics keep flowing, and nothing is
+ever skipped or silently lost. The cost is that one unappliable event stalls its topic until an
+operator resolves it, and there are exactly two resolutions:
+
+- **redrive it** — fix the data (or the mapper) and `POST :3002/run/redrive`
+  (`packages/salesforce/src/redrive.ts`, bearer `CRM_API_TOKEN`, answer
+  `{attempted, applied, skipped_stale, ignored, still_failing}`);
+- **discard it** — when the payload can never apply, `POST :3002/run/discard {"event_ids":[…]}` marks
+  the row `ignored` with an audit reason and moves that channel's checkpoint past it (never
+  backwards), answering `{discarded, not_found, checkpoint_advanced}`. The record is **not** applied;
+  a later extract or a corrected `UPDATE` repairs it. There is no automatic redrive loop and no bulk
+  discard, on purpose: a poison event is a data or code defect, and hiding it in the background is
+  exactly the failure the fix removes.
+
+Either way the block is resolved from the **database**, not from the consumer's memory: on the next
+subscribe the consumer re-reads the channel's `failed` rows — if any remain, the checkpoint stays
+`status='error'` (a plain reconnect therefore cannot make an incident look resolved); if none remain
+it logs `[cdc] … unblocked (no failed events remain at replay=…), resuming`, returns the checkpoint
+to `connected`, and the redelivered event is a duplicate that is skipped **and advances** the
+checkpoint, so the topic drains in order.
+
+What the operator sees while a topic is blocked: the worker log repeats `[cdc][RETRY]` and
+`[cdc][ALERT]`; `GET /api/crm/sync/status` reports `failedEvents: 1` and a checkpoint with
+`status: 'error'` (the dashboard card renders `error · replay <id>` in its checkpoint list and the
+failed counter turns non-zero); the `cdc` run closes as `failed` if it ends while the event is still
+dead-lettered, with `details.blocked`/`details.held` naming the count. The sync card's pill reads
+**"Run in progress"** (amber) the whole time the consumer owns an open `cdc` run, and falls back to
+"Idle" only after the consumer stops or every topic has been disconnected for 30 s.
 
 `reconcile` (`packages/salesforce/src/reconcile.ts`) is the coarse safety net: per object it compares
 the Salesforce row count and newest `SystemModstamp` with the local ones and reports
@@ -231,16 +270,17 @@ affinity, at the cost of a full JSON-RPC envelope per call and no server-initiat
 
 | Failure | What actually happens | Recovery |
 |---|---|---|
-| **Postgres goes down** | `/api/health` → `db:"down"`; API routes 500 via `toErrorResponse`; UI pages error; worker's CDC apply throws → event marked `failed` **and the checkpoint advances** (P0-2), so those changes are lost; `recordCdcEvent`/`markCdcEventProcessed` failures are logged and swallowed | Restart Postgres. Bulk is safe (idempotent upserts). CDC is not: re-run a bulk extract to re-anchor, then reconcile — but a deleted record that only a CDC event knew about stays lost |
+| **Postgres goes down** | `/api/health` → `db:"down"`; API routes 500 via `toErrorResponse`; UI pages error; the worker's CDC apply throws, is retried 3× in-process, then the event is **dead-lettered and its topic blocked** — the checkpoint is *not* advanced, `[cdc][ALERT]` fires, and that topic re-subscribes from the last good checkpoint (`2ffb827`). So no change is lost, but that topic lags until it can apply; `recordCdcEvent`/`markCdcEventProcessed` failures are logged and swallowed | Restart Postgres. Bulk is safe (idempotent upserts). CDC drains by itself once the database accepts the write (the replay re-delivers the blocked event), or `POST :3002/run/redrive` forces it for the `failed` rows |
+| **A CDC event cannot be applied (poison)** | An unmapped picklist value or a constraint violation fails all 3 attempts: `cdc_events.status='failed'` (payload + error kept), `cdc_checkpoints.status='error'` with the `replay_id` **unchanged**, `[cdc][ALERT]` in the log, that topic's stream cancelled and re-subscribed from the same checkpoint. The dashboard shows a non-zero `failed` counter and `error · replay <id>` for that channel — and a reconnect alone does **not** clear it, because the block is re-derived from the `failed` rows. The other three topics keep flowing | Fix the data (or the mapper) then `curl -X POST :3002/run/redrive -H 'authorization: Bearer …'` — the row flips to `applied`, the next subscribe logs `unblocked` and the topic drains. When the payload can never apply, `POST :3002/run/discard {"event_ids":[…]}` marks it `ignored` and moves the checkpoint past it, leaving the record unapplied (the next extract or a corrected `UPDATE` repairs it). Both are in `FINDINGS.md` §3 |
 | **Mock / Salesforce unreachable** | Bulk fails at the first call → `sync_runs.status='failed'` with the error; the worker logs `bulk extract failed — CDC consumer still starts` and keeps consuming (which then also fails). On `all` boot, a bulk success younger than 10 min skips the extract (`WORKER_FORCE_BULK=1` overrides) | Restart the mock (`docker compose restart salesforce-mock`, re-seeds pristine data). Bulk re-runs; the CDC consumer reconnects with backoff 1s→30s |
-| **Worker dies** | Nothing syncs. `restart: "no"` and **no healthcheck on `worker`**, so `docker compose ps` reports `Up` for a dead process and nothing notices. `sync_runs.running` can stay `true` forever (observed) → the dashboard shows "Run in progress" indefinitely | `docker compose restart worker`. Stale `running` rows need a manual `UPDATE sync_runs SET status='failed' WHERE status='running'`. A crashed bulk run is retried on boot unless it succeeded <10 min ago |
+| **Worker dies** | Nothing syncs. `restart: "no"` and **no healthcheck on `worker`**, so `docker compose ps` reports `Up` for a dead process and nothing notices. A crashed **bulk** run leaves `sync_runs.status='running'` forever → the dashboard shows "Run in progress" indefinitely. A crashed **`cdc`** run is reaped as `failed` (`close_reason: 'orphaned'`) by the next consumer at startup | `docker compose restart worker`. Stale bulk runs need a manual `UPDATE sync_runs SET status='failed' WHERE status='running' AND kind='bulk_extract'`. A crashed bulk run is retried on boot unless it succeeded <10 min ago |
 | **MCP server dies** | AI clients lose the tool surface; the CRM is unaffected (`mcp` depends on `web: service_started`, not healthy). `/health` probes the CRM upstream without auth, so it also leaks CRM reachability | `docker compose restart mcp`. Stateless, so no session to rebuild |
 | **CDC stream drops (cleanly)** | Per-topic exponential backoff with jitter, resubscribe from the persisted checkpoint; duplicates suppressed by `event_id`. Proven: `/mock/disconnect` → `reconnecting in ~1000ms (attempt 1)` → `preset=CUSTOM` → applied | Automatic |
 | **Web dies** | CRM and public page 404; MCP tool calls fail with an upstream error (`isError:true`); the worker keeps syncing because it does not need `web` | Healthcheck restarts nothing (`restart: "no"`) — `docker compose up -d web` |
 | **Slow/blocked Postgres pool** | `@poc/core` uses a single shared `pg` pool; queries have no per-statement timeout. A lock held by the advisory-lock path blocks only same-email lead writes | Restart the process holding the lock |
 
-The general shape: **bulk is safe to repeat, CDC is not safe to lose, and nothing is supervised.**
-Compose is configured for a demo, not for uptime.
+The general shape: **bulk is safe to repeat, CDC is never silently lost — but a poison event stalls its
+topic by design — and nothing is supervised.** Compose is configured for a demo, not for uptime.
 
 ---
 

@@ -1,5 +1,29 @@
 # AUDIT — adversarial review of the Salesforce-migration POC
 
+> ## Status header — added after the fixes, not part of the audit
+>
+> This document is **point-in-time**: the findings below are the audit as written against the build
+> it reviewed (`cfb9920`, 2026-11-26). Nothing in the audit itself has been edited — read it as the
+> record of what was wrong then.
+>
+> As committed at `33559d4`:
+>
+> - **3 of 3 P0 fixed** — P0-1 bulk wire contract (`ebb09fb`), P0-2 a failed CDC apply no longer
+>   advances the checkpoint (`2ffb827`, with the operator escape hatches `POST /run/redrive` and
+>   `POST /run/discard` in `f327fd4`, and the block derived from the database in `33559d4`), P0-3 lead
+>   rate limiting (`3398bcc`).
+> - **6 of 8 P1 fixed** — P1-1 and P1-4 (`47471ea`), P1-3 (`2ffb827`), P1-5 (`3398bcc`), P1-7
+>   (`f40dc46`), P1-8 (`47471ea`).
+> - **2 of 8 P1 partial** — P1-2 (the delete guard exists in `@poc/core`, but the CDC consumer and
+>   the redrive helper still call it without the event timestamp) and P1-6 (lockfile and
+>   `web`/`mcp`/`mock` healthchecks landed, `worker` still has none and every service is
+>   `restart: "no"`).
+> - P2s: P2-1, P2-4 and P2-6 fixed; P2-2 and P2-3 partially (the suite now restores the canonical
+>   demo state); P2-5 open.
+>
+> Current behaviour, the accepted head-of-line-blocking tradeoff behind the P0-2 fix, and every
+> residue: [`FINDINGS.md`](FINDINGS.md) §3.
+
 Scope: everything in this repo **except** `apps/web/test/e2e/` (owned by a concurrent
 agent). Date: 2026-11-26. I changed no repository code; the only state-mutating
 experiments ran inside `BEGIN … ROLLBACK` (plus a handful of lead rows I submitted,

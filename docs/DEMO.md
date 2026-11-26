@@ -1,7 +1,7 @@
-# Demo runbook — five demos
+# Demo runbook — six demos
 
 Checklist §9. Each demo is a numbered runbook of exact commands (paste them), what to say while it
-runs, the expected output, and how to reset. Total run time ≈ 20 minutes.
+runs, the expected output, and how to reset. Total run time ≈ 25 minutes.
 
 Prerequisites, once:
 
@@ -19,8 +19,10 @@ Open three terminals if you want to narrate and run at the same time:
 | B | `docker compose exec postgres psql -U poc -d poc_crm` — the database |
 | C | the demo commands below |
 
-> **Before you start:** do **not** run `pnpm test` right before a demo. The suite deliberately
-> rewrites demo rows (`FINDINGS.md` §3, P2-3). If you did, run the reset at the end of this page.
+> **Before you start:** `pnpm test` restores the canonical demo dataset when it finishes
+> (`FINDINGS.md` §3, P2-3), but it runs against this same live stack and takes ~25 s. If the last run
+> was interrupted, check `/mock/health` returns `4/6/6/3` and run the reset below; never start a demo
+> with the worker still blocked on a `failed` event (`docs/FINDINGS.md` §3).
 
 ---
 
@@ -133,7 +135,20 @@ docker compose exec -T postgres psql -U poc -d poc_crm -c \
   -c "select event_id, change_type, status, latency_ms from cdc_events order by received_at desc limit 3;"
 ```
 
-4. Show it in the UI: <http://localhost:3000/crm/opportunities> (stage becomes `Closed Won`).
+4. Show it in the UI: <http://localhost:3000/crm/opportunities> (stage becomes `Closed Won`), and
+   the **Salesforce sync** card on <http://localhost:3000/crm>. The card now reflects the live
+   consumer: the pill reads **"Run in progress"** (amber) for as long as the worker owns its `cdc`
+   sync run, "Last CDC event" shows the event you just applied with a lag of a second or two, and
+   the checkpoint list shows `connected · replay <id>` per channel.
+
+```bash
+docker compose exec -T postgres psql -U poc -d poc_crm -c \
+  "select kind, status, records_read, records_written, details->>'close_reason' as closed, started_at
+     from sync_runs order by started_at desc limit 3;"
+```
+
+That is the row behind the pill: one open `kind='cdc'` row per consumer lifetime (it closes when the
+consumer stops, with p50/max latency in `details`), not one per event.
 
 **Expected output:** before `Negotiation | 2400000.00`; the emit answers
 `{"ok":true,...,"changedFields":["StageName","Amount","Probability","LastModifiedDate","SystemModstamp"],"delivered":1,"queued":false}`;
@@ -194,12 +209,11 @@ is `Negotiation | 1337000.00`, and the checkpoint's `replay_id` is the replayed 
 latency is a full second because the event waited for the reconnect — that is the replay, measured.
 And because `event_id` is unique, a double delivery can't double-apply."
 
-**Then say — this is important and honest:** "This is recovery from a *clean* disconnect. If an event
-fails to apply, the committed build marks it failed and still advances the checkpoint, so that one
-change is lost — that is the top item on our fix list (`docs/FINDINGS.md` §3, P0-2). A rework is in
-the working tree that retries, blocks the topic instead of advancing, and adds `POST /run/redrive`
-for the operator, but its tests were still failing when this runbook was written, so do not claim it
-as delivered."
+**Then say — this is important and honest:** "This is recovery from a *clean* disconnect. The harder
+case is an event that cannot be applied at all. That does not lose the change: the worker retries it
+three times, then stops that topic's checkpoint instead of stepping over it, logs an alert, and waits
+for me to fix the data and redrive — one topic stalls, nothing disappears. That is Demo 6, and the
+tradeoff is written up in `docs/FINDINGS.md` §3."
 
 ---
 
@@ -364,13 +378,158 @@ unticked, and the prompts above are the script to close it."
 
 ---
 
+## Demo 6 — a poison event blocks its topic, the alert fires, then redrive (or deliberately discard)
+
+This is the sharpest demonstration of the P0-2 fix, and the honest one: the system **refuses to skip
+a change it cannot apply**. One unappliable event stops its own topic — visibly — and nothing behind
+it is lost.
+
+**Say:** "Every sync has a version of this question: what happens when an event cannot be applied?
+The old answer — mark it failed and move on — loses the change forever. Watch what happens instead."
+
+1. Confirm the starting state (row + checkpoint):
+
+```bash
+docker compose exec -T postgres psql -U poc -d poc_crm -c \
+  "select stage, amount from opportunities where salesforce_id='006MOCK00002AAAYD2';" \
+  -c "select status, replay_id from cdc_checkpoints where channel='/data/OpportunityChangeEvent';"
+```
+
+Expected: `Qualification | 265000.00`, checkpoint `connected`.
+
+2. Publish an event whose data the CRM cannot map (a real org-side picklist value the POC has never
+   seen). `/mock/emit` accepts any record, so this is a genuine apply-time failure:
+
+```bash
+curl -s -X POST localhost:4000/mock/emit -H 'content-type: application/json' -d '{
+  "object":"Opportunity","changeType":"UPDATE",
+  "record":{"Id":"006MOCK00002AAAYD2","StageName":"Closed Won – Renewal","Amount":900000}}'
+```
+
+3. Watch the retries and the alert (terminal A, or this):
+
+```bash
+sleep 6
+docker compose logs --tail=40 worker | grep -E 'RETRY|ALERT|reconnecting|subscribed'
+```
+
+Expected, in order: three `[cdc][RETRY] … attempt=1/3 … 3/3 error=unmapped StageName: "Closed Won –
+Renewal"` lines, then `[cdc][ALERT] … apply failed after 3 attempts; checkpoint NOT advanced
+(blocked). Fix or redrive.`, then `stream error: … CANCELLED`, `reconnecting in ~1200ms`, and
+`subscribed … preset=CUSTOM replay=<the same checkpoint>` — it comes back to the same place, not the
+tip.
+
+4. Show that the checkpoint held and the row was **not** written:
+
+```bash
+docker compose exec -T postgres psql -U poc -d poc_crm -c \
+  "select event_id, status, left(error,70) as error from cdc_events where status='failed';" \
+  -c "select channel, status, replay_id from cdc_checkpoints where channel='/data/OpportunityChangeEvent';" \
+  -c "select stage, amount from opportunities where salesforce_id='006MOCK00002AAAYD2';"
+```
+
+Expected: one `failed` row carrying the payload and the error, the checkpoint at
+`status='error'` with its **old** `replay_id`, and the opportunity still `Qualification |
+265000.00`. Nothing was lost and nothing was half-applied.
+
+Also open <http://localhost:3000/crm>: the sync card's `failed` counter is now 1 and the checkpoint
+list shows `error · replay <id>` for that channel. The other three channels are still `connected`.
+
+5. Redrive while the data is still broken — it reports, it does not lie:
+
+```bash
+curl -s -X POST localhost:3002/run/redrive \
+  -H 'authorization: Bearer poc-local-token' -H 'content-type: application/json' -d '{"limit":50}'
+```
+
+Expected: `{"attempted":1,"applied":0,"skipped_stale":0,"ignored":0,"still_failing":1}`.
+
+Now pick **one** branch. Both end with the topic draining; they differ in what happens to the record.
+
+### Option A — the data can be fixed: redrive it
+
+6. Fix the event's data and redrive again:
+
+```bash
+docker compose exec -T postgres psql -U poc -d poc_crm -c \
+  "update cdc_events set payload = jsonb_set(payload, '{StageName}', '\"Negotiation\"')
+     where status='failed';"
+curl -s -X POST localhost:3002/run/redrive -H 'authorization: Bearer poc-local-token'
+```
+
+Expected: `{"attempted":1,"applied":1,"skipped_stale":0,"ignored":0,"still_failing":0}`.
+
+7. Watch the topic drain (within the current backoff, at most 30 s):
+
+```bash
+sleep 20
+docker compose logs --tail=30 worker | grep -E 'unblocked|duplicate|outcome='
+docker compose exec -T postgres psql -U poc -d poc_crm -c \
+  "select status, replay_id from cdc_checkpoints where channel='/data/OpportunityChangeEvent';" \
+  -c "select stage, amount from opportunities where salesforce_id='006MOCK00002AAAYD2';"
+```
+
+Expected: `[cdc] /data/OpportunityChangeEvent unblocked (no failed events remain at replay=…),
+resuming`, the redelivered event logged as `outcome=duplicate`, the checkpoint back to `connected`
+with the **new** replay id, and the row now `Negotiation | 900000.00`. Everything that queued behind
+the poison event applies in order.
+
+If `still_failing` is 1 again, you raced the consumer's own retry of the same event: run step 6's
+`redrive` once more. If the row is missing, the demo's reset (below) is the way back.
+
+### Option B — the payload can never apply: discard it deliberately
+
+This is the escape hatch for an event whose data is unrepairable (a value the CRM will never map, a
+constraint it will never satisfy). Use it **instead of** Option A on the same event.
+
+6. Abandon that event, by id, and let the checkpoint move past it:
+
+```bash
+EVENT=$(docker compose exec -T postgres psql -U poc -d poc_crm -tAc \
+  "select event_id from cdc_events where status='failed' limit 1")
+echo "$EVENT"
+curl -s -X POST localhost:3002/run/discard \
+  -H 'authorization: Bearer poc-local-token' -H 'content-type: application/json' \
+  -d "{\"event_ids\":[\"$EVENT\"]}"
+```
+
+Expected: `{"discarded":["/data/OpportunityChangeEvent:…"],"not_found":[],
+"checkpoint_advanced":{"/data/OpportunityChangeEvent":"…"}}`.
+
+7. Show what was and was not done:
+
+```bash
+docker compose exec -T postgres psql -U poc -d poc_crm -c \
+  "select event_id, status, left(error,55) as reason from cdc_events order by received_at desc limit 2;" \
+  -c "select stage, amount from opportunities where salesforce_id='006MOCK00002AAAYD2';" \
+  -c "select status, replay_id from cdc_checkpoints where channel='/data/OpportunityChangeEvent';"
+```
+
+Expected: the event row is `ignored` with `discarded by operator (event abandoned; the record was not
+applied)`, the opportunity is still `Qualification | 265000.00` — **the change is gone on purpose** —
+and the checkpoint is past it (`connected` within ~30 s, when the consumer next subscribes and logs
+`unblocked`). The row stays in `cdc_events` as `ignored`, so the decision is auditable, and the next
+bulk extract or a corrected `UPDATE` is what repairs the record.
+
+**Say (whichever branch you took):** "The tradeoff is explicit: one topic stalled, everything else
+kept flowing, and no change was dropped silently. A retry loop in the background would have hidden
+the unmapped picklist value forever — the alert is the product here. And when the data can never
+apply, abandoning it is a visible, logged, per-event decision rather than a `failed` row nobody looks
+at. That is `docs/FINDINGS.md` §3."
+
+**Reset after this demo is mandatory:** the mock's dataset now holds the unmapped `StageName`, so a
+later bulk extract would (correctly) fail on it. Paste the reset at the top of this page, and confirm
+`cdc_checkpoints` shows four `connected` channels.
+
+---
+
 ## Closing slide material
 
 | Capability | One-line proof | Honest caveat |
 |---|---|---|
 | Bulk import | 19 records, 2.5 s, idempotent | Salesforce is an emulator |
 | CDC | 0–28 ms apply latency | 72 h retention modelled as a 1,000-event buffer |
-| Recovery | replay after a killed stream, no duplicates | a *failed* apply loses the event (P0-2) |
+| Recovery | replay after a killed stream, no duplicates; a poison event blocks its topic and is redriven | one blocked topic stalls until its data is fixed (`FINDINGS.md` §3) |
 | Lead capture | 201 / 200 duplicate / 400 / 429 / honeypot | limiter is per-process memory |
 | MCP | 17 tools, writes visible in the UI, 401 by default | no real model has driven it |
 

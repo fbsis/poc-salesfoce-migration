@@ -1,10 +1,10 @@
 # Findings, limitations and cutover strategy
 
 Checklist §3 "Document recovery limitations and cutover strategy" and §10 deliverables 12–14.
-Written against commit `9175ff3`. Every number here was produced by a command in this repo; where
-something could not be verified it says so. Where the working tree differs from that commit (a CDC
-retry/redrive rework was in flight while this was written), the difference is called out explicitly
-and the *committed* behaviour is what is described.
+Updated against commit `33559d4` (`2ffb827` P0-2/P1-3, `f327fd4` operator discard, `33559d4`
+block-derived-from-database, `ac527fc` deterministic suite). Every number here was produced by a
+command in this repo; where something could not be verified it says so. Line numbers are from
+`33559d4` unless a commit is named, and nothing here describes uncommitted work.
 
 Companion documents: [`AUDIT.md`](AUDIT.md) (the adversarial audit, 17 findings),
 [`ARCHITECTURE.md`](ARCHITECTURE.md) (how it works), [`DEMO.md`](DEMO.md) (the runbook).
@@ -25,7 +25,7 @@ Companion documents: [`AUDIT.md`](AUDIT.md) (the adversarial audit, 17 findings)
 | A visitor can become a CRM lead with no Salesforce involved | `POST /api/leads` → `201 {source:"landing_page", status:"new"}`; duplicate → `200 {duplicate:true}` (same id); invalid → `400` with 3 field errors; 6th rapid submission → `429`; honeypot → `201` decoy with **0 rows** stored; the lead renders in `/crm/leads` and `/crm` |
 | Concurrent duplicate submissions produce one row | `pg_advisory_xact_lock(hashtext(lower(email)))`; `route-limits.test.ts` fires two identical submissions concurrently and asserts one insert (`dedupe.test.ts`, 5 tests) |
 | An AI client can drive the CRM entirely through MCP | `tools/list` → exactly 17 contract tools; `get_sales_summary` `structuredContent` equals `GET /api/crm/reports/sales-summary`; `update_lead_status` → `contacted`, verified through the API **and** the server-rendered page; `POST /mcp` without a bearer → `401` before any CRM call |
-| The whole thing is reproducible from Docker alone | 26 test files / 212 tests / 23.6 s inside `docker compose run --rm tools`; typecheck of 6 packages clean; no host install at any point |
+| The whole thing is reproducible from Docker alone | 28 test files / 218 tests (5 skipped) / ~25 s inside `docker compose run --rm tools` at `ac527fc`, green on two consecutive runs, and the suite restores the canonical demo dataset when it finishes; typecheck of 6 packages clean; no host install at any point |
 
 The engineering that is genuinely production-shaped: parameterised SQL everywhere, constant-time
 bearer checks that fail closed, a vendored Pub/Sub proto that is byte-identical to
@@ -46,51 +46,86 @@ real HTTP, real gRPC and real rendered HTML rather than against mocks.
 | **Sharing rules / record-level access** | The POC has no user model at all: one bearer token, full read/write. Replacing Salesforce means reproducing who may see which record | Not modelled. Out of scope by design, but it is a *functional* gap, not a cosmetic one |
 | **Large-volume behaviour (100k+ records)** | Job polling, CSV pagination, transaction-per-record batch apply, FK resolution and orphan re-linking all have volume-dependent behaviour; `applySalesforceBatch` issues one statement per record | Only 19 records are extracted here. **Unverified** |
 | **A real AI client** (Claude Code / Cursor / Codex) executing the §9 prompts | Raw JSON-RPC proves the protocol; it does not prove a model chooses the right tools, handles `isError`, or formats money correctly | **Unverified** — the config blocks are in `DEMO.md` §5, unused by any automated test |
-| **Poison-event handling** | Lost CDC changes (P0-2, §3) are the highest-consequence defect and were never observed end-to-end: `/mock/emit` cannot manufacture an apply-time throw | **Unverified by observation**, established from the code path and the absence of any redrive |
+| **Poison-event handling** | Lost CDC changes (P0-2) were the highest-consequence defect; the point of the fix is that a poison event is *visible, blocked, and resolvable* — either by redriving it once the data is fixed, or by explicitly discarding it when it never can be — rather than silently dropped | Proven against the mock, not merely argued: unit tests, E2E, and observed live (an emitted `StageName: "Closed Won – Renewal"` → `[cdc][RETRY]` ×3 → `[cdc][ALERT]` → checkpoint `status='error'` with the replay id unchanged → `POST /run/redrive` once the data was fixed → `applied` → `unblocked`; and the discard path → `ignored` + checkpoint advanced). What is *not* proven is operator practice against a real org: who is paged, how fast a payload is repaired, and who is allowed to discard |
 | **Does Bulk API still work at all if `SF_USE_MOCK=false`?** | Every call path assumes the mock's auth, dataset and error shapes | Never attempted. Treat "swap the config" as a two-week task, not a switch |
 
 ---
 
 ## 3. Open defects and limitations after the fixes
 
-Two of the three P0s (P0-1, P0-3) and most P1s from [`AUDIT.md`](AUDIT.md) are fixed and verified in
-code (list at the end of this section). **These are the ones still open at `9175ff3`.** Line numbers
-are from that commit.
+All three P0s and most P1s from [`AUDIT.md`](AUDIT.md) are fixed and verified in code (list at the
+end of this section). **These are the ones still open at `33559d4`.** Line numbers are from that
+commit.
 
-### P0-2 (open as committed) — a failing CDC event advances the checkpoint and is never re-driven
+### The tradeoff P0-2's fix accepts — a poison event blocks its topic (by design, not a bug)
 
-`packages/salesforce/src/cdc.ts:604-618` at `9175ff3`: on an apply throw the event is marked `failed`,
-the checkpoint **still advances**, and nothing re-applies `status='failed'` rows — a replay of the
-same replay id is caught by the `event_id` dedupe and skipped. The result is a permanently lost
-change that the system reports as healthy (`failed: 0` on the dashboard means "nothing failed yet").
+`packages/salesforce/src/cdc.ts:960-1110`: an apply that throws is retried **3× in-process**
+(`APPLY_RETRY_DELAYS_MS = [250, 1_000, 3_000]`). If every attempt fails the event is dead-lettered
+**and the checkpoint is not advanced**: `cdc_events.status='failed'` keeps the payload *and* the
+error, `cdc_checkpoints` is left at `status='error'` (with the message) holding its old `replay_id`,
+that topic's stream is cancelled, `[cdc][ALERT]` is printed, and the reconnect re-subscribes from the
+last good checkpoint — so the poison event is re-delivered and retried, and events *behind* it are
+dropped unrecorded and re-fetched by the replay. Nothing is ever skipped.
 
-Why it matters beyond the data loss: it falsifies the at-least-once promise in `CONTRACTS.md` §7.3,
-and any cutover plan that leans on CDC to keep Salesforce and the CRM equal (see §5, phase 2) leans
-on exactly this guarantee. **This is the single defect that must be closed before a pilot.**
+What that costs, stated plainly:
 
-> **Status of the fix — in flight, uncommitted, not working yet (2026-11-26T00:50Z).** The working
-> tree contains a rework: bounded in-process retry (`APPLY_ATTEMPTS`, 250 ms / 1 s / 3 s), then
-> dead-letter the event **without advancing the checkpoint**, cancel that topic's stream, leave the
-> checkpoint at `status='error'`, print `[cdc][ALERT]`, and hold every later event on that topic
-> unrecorded (`stats.held`) until the poison event lands — deliberate head-of-line blocking, chosen
-> over silent loss. `packages/salesforce/src/redrive.ts` adds `redriveFailedEvents()` (re-apply
-> `failed` rows oldest-first, bypassing the duplicate check, `failed → applied`), exposed as
-> `POST /run/redrive` on the worker control plane. The design is sound and the operator surface is
-> there, but `apps/worker/test/cdc-run.test.ts` (new, untracked) **failed 3 of 7 tests** when this
-> document was written, so **do not describe P0-2 as fixed**. Re-verify before signing anything.
+- one unappliable event stalls **its own** topic until it applies; the other three topics keep
+  flowing. This is deliberate head-of-line blocking, chosen over silent loss: a bounded, visible
+  stall beats a permanently missing change that the dashboard still reports as healthy;
+- the reconnect backoff grows 1 s → 30 s with jitter, so retries do not hammer, and every retry
+  writes the same alert line;
+- there is no automatic redrive loop, on purpose: a poison event is a data or code defect, and
+  retrying it forever in the background hides it. Resolution is a deliberate operator decision —
+  **fix and redrive**, or **discard** when the payload can never apply (below).
 
-### P1-3 (open as committed) — `sync_runs` never records a `cdc` run, and a crashed run sticks `running: true`
+**Recovery 1 — redrive (the payload can apply once the data or the mapper is fixed).**
+`POST :3002/run/redrive` (bearer `CRM_API_TOKEN`, body optional `{"limit":50}`) re-applies every
+`failed` row oldest-first through the same `@poc/core` functions, bypassing the duplicate check, and
+answers `{attempted, applied, skipped_stale, ignored, still_failing}` — a non-zero `still_failing` is
+a report, not an HTTP error. The row flips `failed → applied|skipped_stale|ignored`, and the block
+is resolved from the **database**, not from memory: on that channel's next subscribe the consumer
+re-reads the `failed` rows, logs `[cdc] … unblocked (no failed events remain at replay=…), resuming`,
+returns the checkpoint to `connected`, and the redelivered event is a duplicate that is skipped
+**and advances** the checkpoint. The topic then drains in order. The same read is what stops a bare
+reconnect from clearing an incident: while `failed` rows remain, the checkpoint stays
+`status='error'` (with `blocked by N failed event(s), oldest replay …`) so the sync card keeps
+showing it.
 
-- At `9175ff3`, `startSyncRun` is called only from `bulk.ts:230` and `reconcile.ts:118`. No `cdc` row
-  is ever written, so `GET /api/crm/sync/status` and the dashboard sync card cannot show a CDC job —
-  the only CDC evidence is `cdc_checkpoints` and `cdc_events`. `CONTRACTS.md` §7.5 also promised CDC
-  latency in `sync_runs.details`; at that commit latency lives only on `cdc_events.latency_ms`.
-  (The uncommitted rework noted under P0-2 adds one `cdc` sync run per consumer lifetime with
-  latency p50/max and `close_reason`.)
-- `running` is `SELECT EXISTS (SELECT 1 FROM sync_runs WHERE status = 'running')`
-  (`reporting.ts:158`). There is no reaper and `restart: "no"`, so a worker killed mid-bulk leaves
-  `running: true` **forever**. Observed live: the API returned `"running":true` with no active job,
-  and the dashboard showed "Run in progress".
+**Recovery 2 — discard (the payload can never apply).**
+`POST :3002/run/discard {"event_ids":["<channel>:<replayId>", …]}` marks those `failed` rows
+`ignored` with the audit reason `discarded by operator (event abandoned; the record was not applied)`
+and moves that channel's checkpoint past them (never backwards), answering
+`{discarded, not_found, checkpoint_advanced}`; the tool is
+`discardFailedEvents()` in `packages/salesforce/src/redrive.ts:168`. It is explicit, per event id,
+logged, and auditable — the row stays in `cdc_events` as `ignored` — but **the record that event
+described is not applied**: a later bulk extract or a corrected `UPDATE` from Salesforce is what
+repairs it. There is no bulk "drop everything" and no automatic discard, by design: silently
+abandoning data is the failure this whole mechanism exists to avoid.
+
+Both were observed live in this repo (not inferred): `[cdc][RETRY] … attempt=1/3 … 3/3` →
+`[cdc][ALERT] … checkpoint NOT advanced (blocked)` → `cdc_checkpoints.status='error'` with
+`replay_id` unchanged while the other three channels stayed `connected`; then redrive (after repairing
+the stored payload) → the row `applied`, `unblocked`, `outcome=duplicate`, checkpoint back to
+`connected` and the row updated; and on the other branch, discard → `ignored` +
+`checkpoint advanced to <replay id>` with the record left untouched.
+
+### P1-3 (fixed) — the `cdc` run is recorded, and a dead consumer's run is reaped
+
+`cdc.ts:571-700`: one `sync_runs` row of kind `cdc` per consumer lifetime — opened on `start()`,
+closed on `stop()` or after **every** topic has been disconnected for `CDC_RUN_IDLE_CLOSE_MS`
+(30 s default) with `close_reason: 'disconnected'`, and a new one opened on the next live
+subscription. `details` carries `applied / skipped_stale / ignored / failed / duplicates / blocked /
+held / events`, `latency_ms {p50, max, samples}`, `duration_ms`, `reconnects` and `close_reason`;
+`records_read` = events received, `records_written` = applied; the run closes as `failed` when an
+event was dead-lettered during it. `CdcConsumer.reapOrphanSyncRuns()` (`cdc.ts:600-615`) closes stale
+`kind='cdc'` `running` rows as `failed` / `close_reason: 'orphaned'`, and
+`apps/worker/src/index.ts:147` calls it once at startup — so a container killed before the graceful
+close no longer leaves the dashboard saying "Run in progress" forever.
+
+Residue: this fixes the **CDC** half only. A **bulk** run killed mid-flight still leaves
+`running: true` indefinitely (`reporting.ts:157-160` has no age filter and every service is
+`restart: "no"`), and `worker` still has no healthcheck — P1-6 below.
+
 
 ### P1-6 (partially fixed) — supervision is still demo-grade
 
@@ -103,29 +138,48 @@ the "a rebuild silently resolves today's newest versions" risk. Still open:
 - `mcp` waits on `web: service_started`, not `service_healthy`, so the first tool call can race
   Next's cold compile.
 
-### P1-2 (partially fixed, still open on the CDC path) — an out-of-order DELETE is unguarded
+### P1-2 (still open on the CDC and redrive paths) — an out-of-order DELETE is unguarded
 
-`deleteSalesforceRecord` now accepts `{ updatedAt }` and compares the stamp inside the `DELETE …
-WHERE` (`ingest.ts:688-700`), and `applySalesforceRecord`'s DELETE branch does pass the record's
-timestamp. **But the CDC consumer does not:** at `9175ff3` it calls
-`deleteSalesforceRecord(objectName, sfId)` with two arguments (`cdc.ts:606`), and the working-tree
-rework keeps that two-argument call (`cdc.ts:907`, `redrive.ts:96`). So a replayed or out-of-order
-`DELETE` still removes a row whose `salesforce_updated_at` is newer. Fix is one argument; the
-capability is already there and tested at the core level.
+`deleteSalesforceRecord(object, id, { updatedAt })` compares the stamp inside the `DELETE … WHERE`
+(`ingest.ts:670-700`), and the CDC *upsert* path gets a timestamp through the mapper. **But both
+CDC-side delete callers pass two arguments**: `packages/salesforce/src/cdc.ts:976`
+(`deleteSalesforceRecord(objectName, sfId)`) and `packages/salesforce/src/redrive.ts:99`. So a
+replayed or out-of-order `DELETE` still removes a row whose `salesforce_updated_at` is newer — and
+the replay path is exactly where an old delete arrives late. Verified by reading `33559d4`, not from
+a commit message: the capability exists and is tested at the core level; the consumer does not use
+it. The fix is one argument (`header.commitTimestamp`) threaded through both call sites.
 
-### P2-2 (open) — mock health counts are polluted by test rows
+### P2-2 (partially fixed) — mock health counts are inflated *during* a run
 
 `/mock/health` reported `opportunities: 38` against a 6-record demo dataset after a test run: unit
-tests soft-delete `006VITEST…` records and the mock keeps `IsDeleted` rows. Harmless to the
-pipeline (SOQL excludes them) but misleading in a demo — quote the seeded counts in
+tests soft-delete `006VITEST…` records and the mock keeps `IsDeleted` rows. At `ac527fc` the suite's
+global setup resets and re-seeds the mock (replace, not merge) when the run finishes, so the counts
+come back to the canonical 4/6/6/3 — but only if the run reached its teardown. During a run, and
+after an aborted one, the numbers are still wrong for a demo — quote the seeded counts in
 [`DEMO.md`](DEMO.md), not `:4000/mock/health`.
 
-### P2-3 (open) — `pnpm test` is not hermetic; it rewrites the live demo database
+### P2-3 (partially fixed) — `pnpm test` is not hermetic, and it needs an idle stack
 
-The suite runs against the running Postgres and the running mock. `apps/worker/test/bulk.test.ts`
-`DELETE`s every `001MOCK%`/`003MOCK%`/… row before re-extracting, and `cdc.test.ts` writes real
-`cdc_events` through the live worker. **Never run the full suite directly before a demo** — run the
-reset in `DEMO.md` §reset afterwards, or use a dedicated compose project for tests.
+The suite still runs against the running Postgres and the running mock (deliberate: it proves real
+HTTP, real gRPC, real SQL). At `ac527fc` it is **self-restoring**: `apps/web/test/global-setup.ts`
+returns a teardown that resets and re-seeds the mock with the canonical dataset, deletes the
+Salesforce-mirror rows, runs one real bulk extract and drops leftover test-shaped rows. A completed
+run therefore no longer damages demo state; a run that dies before teardown still can.
+
+What remains: it needs the stack up, and it **owns the stack while it runs**. Anything else using the
+same mock and worker at the same time wins, because the shared in-memory mock and the shared database
+are the fixture: a second concurrent `pnpm test` (each run's teardown restores the dataset the other
+is asserting on, so both fail intermittently), a live demo, or a manual poison-event experiment.
+Observed here: concurrent runs failed on shared-state assertions (`expected 14 to be 30` records,
+`CDC UPDATE reflected in the CRM API` timing out) with the code unchanged. Treat "the suite is green"
+as a statement about an idle stack, and serialise runs rather than debugging the code when the
+numbers move.
+
+The earlier flakiness had the same shape but a different cause, and it is worth recording because it
+looks like a race and is not: a demo opportunity had been mutated to an unmapped `StageName`, the
+strict mapper (P1-8) correctly rejected it, and every bulk-based test failed with `errors=1` — one
+bad row in shared state, not a scheduling problem. The fixture now removes that carrier, but only
+from the state it owns.
 
 ### P2-5 (open) — MCP `/health` probes the CRM upstream without auth
 
@@ -151,10 +205,11 @@ line to make the field static.
 - **Advisory-lock limits**: `hashtext` is 32-bit, so unrelated emails occasionally serialise for a
   millisecond (harmless); there is no `lock_timeout`, so a pathological holder blocks same-email
   writes until its transaction ends.
-- **A failed CDC event blocks its topic** once the in-flight rework lands: that is the right trade
-  (no silent loss) but it means one poison record stops *all* changes on its topic indefinitely,
-  with no automatic escalation beyond an alert line. Operationally that needs an on-call owner and
-  a runbook, which is exactly what `POST /run/redrive` exists for.
+- **A failed CDC event blocks its topic** (P0-2's fix, §3): the right trade over silent loss, but it
+  means one poison record stops *all* changes on its topic until it is resolved — `POST /run/redrive`
+  once the data (or the mapper) is fixed, or `POST /run/discard` when the payload can never apply,
+  leaving that record unapplied. There is no automatic escalation beyond the alert line, so
+  operationally this needs an on-call owner and a runbook — which is what those two endpoints are.
 - **Reconcile is coarse**: counts and newest `SystemModstamp` only. It reported `consistent` while
   local rows were *ahead* of the mock, and it cannot see field-level drift or `failed` events.
 - **`cdc_events.payload` stores the full record as `jsonb`** — convenient, but it is PII at rest
@@ -168,6 +223,8 @@ line to make the field static.
 |---|---|
 | P0-1 bulk used an invented ingest-shaped contract | `packages/salesforce/src/bulk.ts` now `POST jobs/query` with SOQL in the body, polls `jobs/query/:id`, reads `jobs/query/:id/results` paging on `Sforce-Query-Locator`; mock answers 404 for `jobs/ingest*` and `PUT …/batches`; `rest.test.ts` grew substantially (~244 changed lines) and a page-size-1 test in `bulk.test.ts` covers the locator |
 | P0-3 rate limiter collapsed to one global 5-per-10-min bucket | `apps/web/lib/leads/rate-limit.ts` three-bucket design; private/loopback/CGNAT addresses are treated as unattributable and take the global path; `429` no longer hits the 6th visitor; `rate-limit.test.ts`, `route-limits.test.ts` |
+| P0-2 a failing CDC event advanced the checkpoint and was never re-driven | `packages/salesforce/src/cdc.ts:960-1110`: 3 in-process attempts (250 ms / 1 s / 3 s), then dead-letter the event **without** advancing the checkpoint (`blockOnFailure` leaves `cdc_checkpoints.status='error'` and cancels that topic's stream), `[cdc][ALERT]`, and re-subscribe from the same checkpoint. Resolution is operator-driven and auditable: `packages/salesforce/src/redrive.ts` — `redriveFailedEvents()` behind `POST :3002/run/redrive`, and `discardFailedEvents()` behind `POST :3002/run/discard` for a payload that can never apply (`f327fd4`). The block is re-derived from the `failed` rows on every subscribe (`33559d4`), so a reconnect cannot make the incident disappear. Covered by `apps/worker/test/cdc-run.test.ts` and the poison-event drill; observed live (`RETRY` ×3 → `ALERT` → `checkpoint status=error`, replay id unchanged → redrive → `applied`/`unblocked`; and discard → `ignored` + checkpoint advanced) |
+| P1-3 no `cdc` row in `sync_runs`, and a crashed run stuck at `running: true` | `cdc.ts:571-700`: one `cdc` run per consumer lifetime, counters + `details.latency_ms` + `close_reason`, closed as `failed` when an event was dead-lettered, idle-closed after 30 s of every topic being down; `CdcConsumer.reapOrphanSyncRuns()` at worker startup (`apps/worker/src/index.ts:147`). `/api/crm/sync/status` therefore answers `running: true` while the consumer is up (the card reads "Run in progress", not "Idle") |
 | P1-1 timestamp-less writes could regress rows | Guard is now `EXCLUDED.salesforce_updated_at IS NOT NULL AND … >= COALESCE(…)`; reject path returns `ignored` / `missing timestamp`; `ingest.test.ts` grew by ~243 changed lines with dedicated cases |
 | P1-2 DELETE had no staleness guard | `deleteSalesforceRecord(object, id, { updatedAt})` compares the stamp inside the `DELETE … WHERE` (`ingest.ts:688-700`) — **but the CDC path still calls it without a timestamp, see the open list above** |
 | P1-4 orphans never re-linked on the CDC path | `linkOrphanRecords()` runs after every applied Account upsert as well as after every batch (`ingest.ts:607`) |
@@ -186,7 +243,7 @@ Ordered by how much damage the current shortcut causes, not by effort.
 
 | # | Requirement | Why the POC's approach fails at scale | Concrete shape |
 |---|---|---|---|
-| 1 | **Close the CDC loss window** (P0-2) | A dropped change is invisible and permanent; the sync reports healthy | Retry with exponential backoff inside the consumer; advance the checkpoint only over the contiguous applied prefix; a `replayFailedEvents()` job with an attempt counter and alerting on `status='failed' AND attempts > N` |
+| 1 | **Operate the CDC window you closed** (P0-2's residue) | The loss window is closed in-process at `2ffb827`: a poison event blocks its topic, and `redrive`/`discard` (`f327fd4`) resolve it. What is missing is the operational half: no attempt counter on `cdc_events`, no escalation beyond an `[cdc][ALERT]` log line, no metrics/alerts, and no approval trail for `POST /run/discard` — the endpoint is authenticated but anyone holding `CRM_API_TOKEN` can abandon data | Promote the alert to a real alert (`failed > 0`, or a checkpoint in `status='error'` older than N minutes), expose `sync_runs.details.blocked`/`held` as metrics, keep a retry-attempt count per event, and gate discard behind a named approver plus an immutable audit record |
 | 2 | **A real queue / outbox instead of in-process retry** | Retries die with the process; there is no backpressure, no dead-letter surface, no cross-process work distribution; a second worker would double-apply | Postgres outbox + `SELECT … FOR UPDATE SKIP LOCKED` (sufficient here) or SQS/Kafka; one consumer group per topic; idempotency keyed on `event_id` (already unique) |
 | 3 | **Idempotency at scale** | Per-record statements are correct but slow; a re-run of bulk re-reads everything | Batched `COPY`/multi-row upsert with the same SQL guard; a run-level watermark (`SystemModstamp` high-water mark) so re-runs read the delta, not the world; bounded concurrency with a per-object limit |
 | 4 | **Supervision and deployment** | `restart: "no"`, one missing healthcheck, no replicas, no rolling deploy | `restart: unless-stopped`, healthcheck on `worker` (it has `/health` on :3002 already), readiness gates, a real orchestrator or at least restart policies plus alerting on `sync_runs.status='failed'` and on checkpoint age |
@@ -216,7 +273,9 @@ process decisions.
 Exit criteria: production-grade plumbing from §4 rows 1, 2, 4, 5, 6, 7 in place; the CDC loss window
 closed; a real org reachable read-only.
 
-- Close P0-2 and the P1-3 supervision gap; add the worker healthcheck and restart policy.
+- P0-2 is closed in-process (`2ffb827`) and P1-3's CDC half too; still close the **bulk** half of P1-3
+  and the P1-6 supervision gap: worker healthcheck, `restart: unless-stopped`, an age filter on
+  `sync_runs.status='running'`.
 - External Client App in the client's org, read-only scopes, OAuth working from a staging deploy.
 - Observability before volume, not after.
 - Inventory: every field, record type, picklist, validation rule, workflow/flow, report and
@@ -254,11 +313,16 @@ Safe because: nothing yet depends on the CRM; every divergence is a *finding*, n
 
 Exit criteria: 14 consecutive days with zero unexplained divergence; `cdc_events.failed = 0` **and an
 alert if it ever isn't**; checkpoint lag < 1 minute p95; a deliberate poison event is injected and
-recovered by the redrive (this is what makes P0-2's fix testable, and it must be proven here).
+recovered by the redrive **in the client's org** (the mechanism exists at `2ffb827` and was drilled
+against the mock — this gate is what proves it against real picklist values and real payloads), and
+the policy for abandoning an event that can never apply is agreed and written down.
 
-**Risk**: a silent CDC gap (this is P0-2's exact shape) makes the CRM drift while looking healthy.
-**Mitigation**: the daily compare must be independent of CDC — read counts *and* per-row checksums
-from both sides; alert on any difference instead of just reporting it.
+**Risk**: a topic sits blocked behind one poison event and nobody reads the log for a week — the CRM
+ages quietly while every other signal looks healthy. Blocking removed the *silent loss*, not the
+*silent staleness*. **Mitigation**: alert on `cdc_checkpoints.status='error'` and on checkpoint age
+(`last_event_at` older than N minutes), not only on `failed > 0`; the daily compare must be
+independent of CDC — read counts *and* per-row checksums from both sides, and alert on any
+difference instead of just reporting it.
 
 **Risk**: the 72-hour retention window is exceeded during an outage, and replay cannot reach the lost
 events. **Mitigation**: alert when a checkpoint's `last_event_at` exceeds a fraction of retention
@@ -329,6 +393,6 @@ phase gate is a measurement (counts, checksums, lag, failed events) rather than 
 
 The architecture is sound and the risky part is not the CRM — it is the **boundary**: picklist and
 permission mapping, the long tail of reports and integrations, and the guarantee that no change is
-lost between the two systems. The POC demonstrates the first and the third are buildable; it does not
-demonstrate they are done, and one defect (P0-2) stands directly between the current state and
-Phase 2.
+lost between the two systems. The POC now demonstrates all three are buildable: no change is dropped
+silently (a poison event blocks its topic and is redriven, §3), and the two remaining obstacles are
+supervision/operability and the fact that nothing has ever spoken to a real org.

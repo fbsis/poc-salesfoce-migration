@@ -23,19 +23,22 @@ Prioritize technical validation, integration reliability, and demonstrable busin
 A box is ticked only where there was evidence — in the code, in the test suite, or in the running
 system — never because a file exists. The baseline was the adversarial audit in
 [`AUDIT.md`](AUDIT.md) (17 findings, with a coverage table in its §4); every item was then
-re-checked against commit `9175ff3`, corrected for fixes that landed after the audit, and corrected
-again for defects that are still open.
+re-checked against commit `33559d4`, corrected for fixes that landed after the audit (`ebb09fb`,
+`3398bcc`, `47471ea`, `f40dc46`, `2ffb827`, `f327fd4`, `33559d4`), and corrected again for defects
+that are still open.
 
-Evidence used: `docker compose run --rm tools pnpm test` → **26 files / 212 tests, all passing in
-23.6 s** (at commit `9175ff3`); `pnpm typecheck` → 6 packages clean; the end-to-end suite that
-drives the live stack over HTTP and gRPC (**18 tests**, `apps/web/test/e2e/`); and manual
-reproduction of every demo, curl endpoint and SQL query quoted in [`DEMO.md`](DEMO.md) and
+Evidence used: `docker compose run --rm tools pnpm test` → **28 files / 218 tests** (5 skipped), green
+on two consecutive runs of ~25 s each, at commit `ac527fc`; `pnpm typecheck` → 6 packages clean; the
+end-to-end suite that drives the live stack over HTTP and gRPC (**18 tests**, `apps/web/test/e2e/`);
+and manual reproduction of every demo, curl endpoint and SQL query quoted in [`DEMO.md`](DEMO.md) and
 [`FINDINGS.md`](FINDINGS.md).
 
-The status below is the **committed** state. While this was written, a CDC retry/redrive rework was
-in the working tree, uncommitted and with failing tests (`packages/salesforce/src/cdc.ts`,
-`redrive.ts`, `apps/worker/test/cdc-run.test.ts`); it is described as in-flight — never as done —
-and nothing below is ticked on the strength of it.
+The status below is the **committed** state at `33559d4`, which includes the CDC retry /
+head-of-line-block / `POST /run/redrive` / `POST /run/discard` path and the `cdc` row in `sync_runs`
+(`2ffb827`, `f327fd4`, `33559d4`; audit P0-2 and P1-3). The suite numbers are from `ac527fc`.
+Nothing here is ticked on the strength of uncommitted work, and the one thing the suite cannot prove
+is stated where it matters: it runs against the live compose stack (P2-3), so it is only green on an
+idle stack.
 
 **The caveat that governs this whole document: there is no Salesforce org.** All Salesforce traffic
 went to `apps/salesforce-mock`, a local emulator that implements the published Bulk API 2.0
@@ -45,8 +48,9 @@ real org is left unticked and annotated with `⚠️`; [`FINDINGS.md`](FINDINGS.
 unverified areas.
 
 Deliberately unticked everywhere, for the same reason: a real org (OAuth / External Client App,
-Bulk limits, FLS, record types and picklists, sharing rules, the 72 h retention window), a real AI
-client driving the MCP tools, and a poison CDC event observed end-to-end.
+Bulk limits, FLS, record types and picklists, sharing rules, the 72 h retention window) and a real
+AI client driving the MCP tools. A poison CDC event is no longer in that list: it is exercised in
+`apps/worker/test/cdc-run.test.ts`, in the E2E suite, and live via [`DEMO.md`](DEMO.md) Demo 6.
 
 ---
 
@@ -179,10 +183,13 @@ Salesforce integrations must remain isolated from internal CRM operations.
 - [x] Implement basic reconciliation.
 - [x] Document recovery limitations and cutover strategy.
 
-> Now written: [`FINDINGS.md`](FINDINGS.md) §3 documents the recovery limitations (including finding
-> **P0-2** — in the committed build a *failed* CDC apply advances the checkpoint and loses the event;
-> a retry/block/redrive rework exists uncommitted in the working tree with failing tests, so it is
-> not claimed as fixed) and §5 is the six-month cutover strategy.
+> Now written: [`FINDINGS.md`](FINDINGS.md) §3 documents the recovery limitations — including the
+> accepted tradeoff behind the P0-2 fix (one unappliable event **blocks its topic** instead of being
+> skipped: retried 3×, checkpoint held at `status='error'`, `[cdc][ALERT]`, resolved with
+> `POST :3002/run/redrive` once the data is fixed, or `POST :3002/run/discard` when it can never
+> apply; commits `2ffb827`, `f327fd4`) — and §5 is the six-month cutover strategy. The limitation
+> that remains real is operational, not correctness: the topic stays blocked until someone makes that
+> decision, and discard knowingly leaves the record unapplied.
 
 For this POC, Salesforce remains authoritative for imported records.
 
@@ -202,9 +209,14 @@ Build a small CRM with Next.js, TypeScript, and Tailwind CSS.
 - [x] Opportunities by stage.
 - [x] Salesforce synchronization status.
 
-> ⚠️ The card reads live data, with two known gaps: `sync_runs` never records a `cdc` run (CDC has
-> no run entry), and a crashed run leaves `running: true`, which renders as "Run in progress"
-> indefinitely ([`FINDINGS.md`](FINDINGS.md) §3, P1-3).
+> ⚠️ The card reads live data. `sync_runs` now records one `cdc` row per consumer lifetime, so the
+> pill shows **"Run in progress"** (amber) while the consumer is up instead of a permanent "Idle";
+> the checkpoint list shows each channel's status (`connected`, or `error` while a poison event is
+> blocking it), and the `failed` counter is the alert signal. Remaining gaps: a crashed **bulk** run
+> still leaves `running: true` and renders as "Run in progress" indefinitely (the `cdc` half is
+> reaped at consumer startup), and the card does not surface `sync_runs.details` (p50 latency,
+> `blocked`/`held`) — you read those from the worker log or SQL
+> (`apps/worker/README.md`, [`FINDINGS.md`](FINDINGS.md) §3).
 
 ### Accounts
 
@@ -564,8 +576,9 @@ Verify the updated status in the CRM.
 > ⚠️ Rule 8 ("use real Salesforce APIs for migration and CDC") was **not satisfied**: no real
 > Salesforce API was called. Everything Salesforce-shaped ran against the local emulator — see §3
 > above and [`FINDINGS.md`](FINDINGS.md) §1–2. Rule 11 was upheld: neither the audit nor this
-> rewrite found a fabricated result. Capabilities 1, 2, 4 and 5 are demonstrated end to end against
-> the emulator; capability 3 is demonstrated for clean disconnects only (open finding P0-2).
+> rewrite found a fabricated result. All five capabilities are demonstrated end to end against the
+> emulator, including the failure path: a poison CDC event blocks its topic, alerts, and is
+> recovered by `POST /run/redrive` ([`DEMO.md`](DEMO.md) Demo 6).
 
 ## Definition of Success
 
