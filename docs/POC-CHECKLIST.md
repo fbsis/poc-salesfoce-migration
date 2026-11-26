@@ -18,6 +18,38 @@ Prioritize technical validation, integration reliability, and demonstrable busin
 
 ---
 
+## How this checklist was verified
+
+A box is ticked only where there was evidence — in the code, in the test suite, or in the running
+system — never because a file exists. The baseline was the adversarial audit in
+[`AUDIT.md`](AUDIT.md) (17 findings, with a coverage table in its §4); every item was then
+re-checked against commit `9175ff3`, corrected for fixes that landed after the audit, and corrected
+again for defects that are still open.
+
+Evidence used: `docker compose run --rm tools pnpm test` → **26 files / 212 tests, all passing in
+23.6 s** (at commit `9175ff3`); `pnpm typecheck` → 6 packages clean; the end-to-end suite that
+drives the live stack over HTTP and gRPC (**18 tests**, `apps/web/test/e2e/`); and manual
+reproduction of every demo, curl endpoint and SQL query quoted in [`DEMO.md`](DEMO.md) and
+[`FINDINGS.md`](FINDINGS.md).
+
+The status below is the **committed** state. While this was written, a CDC retry/redrive rework was
+in the working tree, uncommitted and with failing tests (`packages/salesforce/src/cdc.ts`,
+`redrive.ts`, `apps/worker/test/cdc-run.test.ts`); it is described as in-flight — never as done —
+and nothing below is ticked on the strength of it.
+
+**The caveat that governs this whole document: there is no Salesforce org.** All Salesforce traffic
+went to `apps/salesforce-mock`, a local emulator that implements the published Bulk API 2.0
+query-job contract, a byte-compatible subset of the Pub/Sub gRPC proto from
+`forcedotcom/pub-sub-api`, and real Avro-encoded CDC payloads. Anything that can only be true of a
+real org is left unticked and annotated with `⚠️`; [`FINDINGS.md`](FINDINGS.md) §2 lists the
+unverified areas.
+
+Deliberately unticked everywhere, for the same reason: a real org (OAuth / External Client App,
+Bulk limits, FLS, record types and picklists, sharing rules, the 72 h retention window), a real AI
+client driving the MCP tools, and a poison CDC event observed end-to-end.
+
+---
+
 ## 1. Technology Stack
 
 | Component | Technology |
@@ -84,37 +116,73 @@ Salesforce integrations must remain isolated from internal CRM operations.
 - [ ] Explore Accounts, Contacts, and Opportunities.
 - [ ] Identify object relationships and custom fields.
 - [ ] Enable supported CDC events.
+
+> ⚠️ Four topics are implemented — `/data/{Account,Contact,Opportunity,Lead}ChangeEvent` — in the
+> emulator. Nothing has been enabled in a real org.
+
 - [ ] Validate Bulk API 2.0 access.
 - [ ] Document API limits and relevant permissions.
 
+> ⚠️ **There is no Salesforce org in this POC.** Everything Salesforce-shaped ran against
+> `apps/salesforce-mock`: the published Bulk API 2.0 query-job contract, a byte-compatible subset of
+> the Pub/Sub gRPC proto, and real Avro CDC payloads. OAuth is client-credentials against the mock —
+> no External Client App was created, and no org limits or permissions were read. **No custom objects
+> or custom fields were discovered** (there is no org to inspect); relationships were identified for
+> the four emulated objects (Account → Contact/Opportunity, Lead standalone). The public quotas
+> (72 h Pub/Sub retention, `num_requested` cap 100, Bulk concurrency) are documented from
+> Salesforce's documentation in [`FINDINGS.md`](FINDINGS.md) §2 — not measured.
+
 ### Initial Data Migration
 
-- [ ] Extract Salesforce Accounts.
-- [ ] Extract Contacts and Opportunities.
-- [ ] Import data into PostgreSQL.
-- [ ] Preserve original Salesforce IDs.
-- [ ] Preserve relationships between entities.
-- [ ] Implement idempotent upsert operations.
-- [ ] Validate record counts and data consistency.
+- [x] Extract Salesforce Accounts.
+- [x] Extract Contacts and Opportunities.
+- [x] Import data into PostgreSQL.
+- [x] Preserve original Salesforce IDs.
+- [x] Preserve relationships between entities.
+- [x] Implement idempotent upsert operations.
+- [x] Validate record counts and data consistency.
 
 ### Change Data Capture
 
-- [ ] Connect to Salesforce Pub/Sub API.
-- [ ] Subscribe to Account and Opportunity events.
-- [ ] Handle CREATE, UPDATE, DELETE, and UNDELETE.
-- [ ] Persist replay checkpoints.
-- [ ] Implement reconnect and replay.
-- [ ] Handle duplicate events.
-- [ ] Investigate event ordering.
-- [ ] Measure synchronization latency.
+- [x] Connect to Salesforce Pub/Sub API.
+- [x] Subscribe to Account and Opportunity events.
+- [x] Handle CREATE, UPDATE, DELETE, and UNDELETE.
+- [x] Persist replay checkpoints.
+- [x] Implement reconnect and replay.
+- [x] Handle duplicate events.
+- [x] Investigate event ordering.
+
+> ⚠️ Ordering is investigated per topic: one serialised queue per channel, plus a stale-write guard
+> that rejects an out-of-order event (`02-cdc.test.ts` pins an older `SystemModstamp` and asserts
+> `skipped_stale`). Cross-topic ordering does not exist — topics are independent, which is why
+> orphan re-linking is needed. The mock re-stamps `SystemModstamp` unless the caller pins it, so
+> genuine out-of-order *delivery* is only reachable from a test.
+
+- [x] Measure synchronization latency.
 
 ### Migration Consistency
 
 - [ ] Capture changes during initial extraction.
-- [ ] Prevent older snapshots from overwriting newer updates.
-- [ ] Test concurrent changes.
-- [ ] Implement basic reconciliation.
-- [ ] Document recovery limitations and cutover strategy.
+
+> ⚠️ **Not covered.** There is no snapshot/CDC overlap test, and on a virgin database the consumer
+> starts at `LATEST` — changes made *during* the first bulk extract are only recovered if a
+> checkpoint already exists and the broker still retains them. Closing this is phase 2 of the
+> cutover plan in [`FINDINGS.md`](FINDINGS.md) §5.
+
+- [x] Prevent older snapshots from overwriting newer updates.
+
+> ⚠️ True of every **upsert**, proven concurrency test included. Not yet true of the CDC **delete**
+> path: `deleteSalesforceRecord` has the guard, but the consumer calls it without the event
+> timestamp, so a replayed DELETE can still remove a newer row (open finding P1-2,
+> [`FINDINGS.md`](FINDINGS.md) §3).
+- [x] Test concurrent changes.
+- [x] Implement basic reconciliation.
+- [x] Document recovery limitations and cutover strategy.
+
+> Now written: [`FINDINGS.md`](FINDINGS.md) §3 documents the recovery limitations (including finding
+> **P0-2** — in the committed build a *failed* CDC apply advances the checkpoint and loses the event;
+> a retry/block/redrive rework exists uncommitted in the working tree with failing tests, so it is
+> not claimed as fixed) and §5 is the six-month cutover strategy.
 
 For this POC, Salesforce remains authoritative for imported records.
 
@@ -126,43 +194,57 @@ Build a small CRM with Next.js, TypeScript, and Tailwind CSS.
 
 ### Dashboard
 
-- [ ] Total Accounts.
-- [ ] Total Contacts.
-- [ ] Total Opportunities.
-- [ ] Total Leads.
-- [ ] Recent Leads.
-- [ ] Opportunities by stage.
-- [ ] Salesforce synchronization status.
+- [x] Total Accounts.
+- [x] Total Contacts.
+- [x] Total Opportunities.
+- [x] Total Leads.
+- [x] Recent Leads.
+- [x] Opportunities by stage.
+- [x] Salesforce synchronization status.
+
+> ⚠️ The card reads live data, with two known gaps: `sync_runs` never records a `cdc` run (CDC has
+> no run entry), and a crashed run leaves `running: true`, which renders as "Run in progress"
+> indefinitely ([`FINDINGS.md`](FINDINGS.md) §3, P1-3).
 
 ### Accounts
 
-- [ ] List Accounts.
-- [ ] View Account details.
+- [x] List Accounts.
+- [x] View Account details.
 - [ ] Create and update local Accounts.
-- [ ] Search Accounts.
+
+> ⚠️ **Partial.** List / view / create / search are all in the UI, but **update has no screen**:
+> `app/crm/actions.ts` exports `createAccountAction`, `createOpportunityAction`,
+> `updateOpportunityAction` and `updateLeadStatusAction` — no `updateAccountAction`. `PATCH
+> /api/crm/accounts/:id` works.
+
+- [x] Search Accounts.
 
 ### Contacts
 
-- [ ] List Contacts.
-- [ ] View Contact details.
+- [x] List Contacts.
+- [x] View Contact details.
 - [ ] Associate Contacts with Accounts.
+
+> ⚠️ **Partial.** Contacts are read-only in the UI. Association is possible only through
+> `POST /api/crm/contacts` with `{ account_id }`, or by the Salesforce sync; the link is then
+> displayed on the contact detail page.
 
 ### Opportunities
 
-- [ ] List Opportunities.
-- [ ] Create and update local Opportunities.
-- [ ] Display stage, amount, and expected close date.
-- [ ] Filter by stage.
+- [x] List Opportunities.
+- [x] Create and update local Opportunities.
+- [x] Display stage, amount, and expected close date.
+- [x] Filter by stage.
 
 ### Leads
 
-- [ ] List Leads.
-- [ ] View Lead details.
-- [ ] Search Leads.
-- [ ] Filter by status.
-- [ ] Update Lead status: New, Contacted, Qualified, Closed.
-- [ ] Display Lead source.
-- [ ] Display Lead creation date.
+- [x] List Leads.
+- [x] View Lead details.
+- [x] Search Leads.
+- [x] Filter by status.
+- [x] Update Lead status: New, Contacted, Qualified, Closed.
+- [x] Display Lead source.
+- [x] Display Lead creation date.
 
 Keep the UI simple: navigation, tables, forms, and basic status indicators.
 
@@ -178,12 +260,12 @@ This page represents a real business workflow: **a visitor becomes a lead inside
 
 Route: `/lead`
 
-- [ ] Create a simple responsive landing page using Tailwind CSS.
-- [ ] Display a title such as "Find Your Next Home".
-- [ ] Add a short description inviting visitors to register.
-- [ ] Create a lead registration form.
-- [ ] Show a success message after submission.
-- [ ] Display validation errors.
+- [x] Create a simple responsive landing page using Tailwind CSS.
+- [x] Display a title such as "Find Your Next Home".
+- [x] Add a short description inviting visitors to register.
+- [x] Create a lead registration form.
+- [x] Show a success message after submission.
+- [x] Display validation errors.
 
 ### Lead Form Fields
 
@@ -198,24 +280,24 @@ Route: `/lead`
 
 ### Backend Integration
 
-- [ ] Implement `POST /api/leads`.
-- [ ] Validate and sanitize submitted input.
-- [ ] Save the Lead directly into PostgreSQL.
-- [ ] Generate a unique Lead ID.
-- [ ] Set `source = "landing_page"`.
-- [ ] Set `status = "new"`.
-- [ ] Store the creation timestamp.
-- [ ] Add basic duplicate detection by email.
-- [ ] Add basic rate limiting or spam protection.
-- [ ] Avoid exposing CRM administrative endpoints publicly.
+- [x] Implement `POST /api/leads`.
+- [x] Validate and sanitize submitted input.
+- [x] Save the Lead directly into PostgreSQL.
+- [x] Generate a unique Lead ID.
+- [x] Set `source = "landing_page"`.
+- [x] Set `status = "new"`.
+- [x] Store the creation timestamp.
+- [x] Add basic duplicate detection by email.
+- [x] Add basic rate limiting or spam protection.
+- [x] Avoid exposing CRM administrative endpoints publicly.
 
 ### CRM Integration
 
-- [ ] Display submitted Leads in the CRM.
-- [ ] Show new Leads on the dashboard.
-- [ ] Allow users to inspect Lead details.
-- [ ] Allow users to update Lead status.
-- [ ] Display the original Lead source.
+- [x] Display submitted Leads in the CRM.
+- [x] Show new Leads on the dashboard.
+- [x] Allow users to inspect Lead details.
+- [x] Allow users to update Lead status.
+- [x] Display the original Lead source.
 
 ### Expected Flow
 
@@ -256,44 +338,50 @@ Use Streamable HTTP transport and expose business operations through the interna
 
 ### MCP Infrastructure
 
-- [ ] Create a Node.js MCP server.
-- [ ] Implement Streamable HTTP transport.
-- [ ] Connect to internal CRM services.
-- [ ] Define structured tool inputs and outputs.
-- [ ] Validate parameters.
-- [ ] Add minimal access controls.
+- [x] Create a Node.js MCP server.
+- [x] Implement Streamable HTTP transport.
+- [x] Connect to internal CRM services.
+- [x] Define structured tool inputs and outputs.
+- [x] Validate parameters.
+- [x] Add minimal access controls.
 - [ ] Test using an MCP-compatible AI client.
+
+> ⚠️ **Not done.** The server is exercised exactly as an agent would call it — `initialize`,
+> `tools/list`, `tools/call` over Streamable HTTP with the real `Accept` and bearer headers — and the
+> write is verified through the CRM API *and* the rendered HTML. But no Claude Code / Cursor / Codex
+> client has been connected, so no model has chosen a tool. Config and the exact prompts are in
+> [`DEMO.md`](DEMO.md) §5; this stays unticked until someone runs them.
 
 ### MCP Tools
 
 **Accounts**
 
-- [ ] `list_accounts`
-- [ ] `get_account`
-- [ ] `search_accounts`
-- [ ] `create_account`
-- [ ] `update_account`
+- [x] `list_accounts`
+- [x] `get_account`
+- [x] `search_accounts`
+- [x] `create_account`
+- [x] `update_account`
 
 **Opportunities**
 
-- [ ] `list_opportunities`
-- [ ] `get_opportunity`
-- [ ] `create_opportunity`
-- [ ] `update_opportunity`
+- [x] `list_opportunities`
+- [x] `get_opportunity`
+- [x] `create_opportunity`
+- [x] `update_opportunity`
 
 **Leads**
 
-- [ ] `list_leads`
-- [ ] `get_lead`
-- [ ] `search_leads`
-- [ ] `update_lead_status`
+- [x] `list_leads`
+- [x] `get_lead`
+- [x] `search_leads`
+- [x] `update_lead_status`
 
 **Reporting**
 
-- [ ] `get_sales_summary`
-- [ ] `get_opportunities_by_stage`
-- [ ] `get_lead_summary`
-- [ ] `get_sync_status`
+- [x] `get_sales_summary`
+- [x] `get_opportunities_by_stage`
+- [x] `get_lead_summary`
+- [x] `get_sync_status`
 
 ### AI Demonstration
 
@@ -333,15 +421,20 @@ The agent must operate through MCP tools, not direct database connections.
 
 Investigate how existing tools could reduce the Salesforce replacement effort.
 
-- [ ] Research official Salesforce MCP integrations.
-- [ ] Explore AI-assisted Salesforce metadata discovery.
-- [ ] Identify custom objects and relationships.
-- [ ] Evaluate AI-generated data mappings.
-- [ ] Investigate AWS AppFlow.
-- [ ] Compare Pub/Sub API with EventBridge-based integration.
-- [ ] Evaluate relevant HubSpot migration capabilities.
-- [ ] Identify opportunities for deterministic automation.
-- [ ] Distinguish useful AI automation from unnecessary complexity.
+- [x] Research official Salesforce MCP integrations.
+- [x] Explore AI-assisted Salesforce metadata discovery.
+- [x] Identify custom objects and relationships.
+- [x] Evaluate AI-generated data mappings.
+- [x] Investigate AWS AppFlow.
+
+> ⚠️ Researched and documented, but the load-bearing rejection reason — a "fixed 10 MB event buffer,
+> events may be dropped" — **could not be confirmed against any source** ([`AUDIT.md`](AUDIT.md) §6).
+> Treat the AppFlow comparison as provisional.
+
+- [x] Compare Pub/Sub API with EventBridge-based integration.
+- [x] Evaluate relevant HubSpot migration capabilities.
+- [x] Identify opportunities for deterministic automation.
+- [x] Distinguish useful AI automation from unnecessary complexity.
 
 MCP should accelerate discovery and business operations, not replace reliable data migration pipelines.
 
@@ -351,40 +444,40 @@ MCP should accelerate discovery and business operations, not replace reliable da
 
 ### Salesforce Migration
 
-- [ ] Import records from Salesforce.
-- [ ] Validate field mappings and relationships.
-- [ ] Verify record counts.
-- [ ] Test idempotency.
-- [ ] Validate data consistency.
+- [x] Import records from Salesforce.
+- [x] Validate field mappings and relationships.
+- [x] Verify record counts.
+- [x] Test idempotency.
+- [x] Validate data consistency.
 
 ### CDC
 
-- [ ] Test CREATE.
-- [ ] Test UPDATE.
-- [ ] Test DELETE.
-- [ ] Test consumer interruption.
-- [ ] Test replay after reconnection.
-- [ ] Check synchronization latency.
+- [x] Test CREATE.
+- [x] Test UPDATE.
+- [x] Test DELETE.
+- [x] Test consumer interruption.
+- [x] Test replay after reconnection.
+- [x] Check synchronization latency.
 
 ### Lead Capture
 
-- [ ] Submit a Lead from the public landing page.
-- [ ] Verify PostgreSQL persistence.
-- [ ] Confirm the Lead appears in the CRM.
-- [ ] Test required field validation.
-- [ ] Test duplicate email behavior.
-- [ ] Update Lead status.
-- [ ] Query the Lead through MCP.
+- [x] Submit a Lead from the public landing page.
+- [x] Verify PostgreSQL persistence.
+- [x] Confirm the Lead appears in the CRM.
+- [x] Test required field validation.
+- [x] Test duplicate email behavior.
+- [x] Update Lead status.
+- [x] Query the Lead through MCP.
 
 ### MCP
 
 - [ ] Connect a real AI client.
-- [ ] Discover available tools.
-- [ ] Query Accounts and Opportunities.
-- [ ] Query newly registered Leads.
-- [ ] Update a Lead through an MCP tool.
-- [ ] Verify the change in the CRM interface.
-- [ ] Reject unauthorized operations.
+- [x] Discover available tools.
+- [x] Query Accounts and Opportunities.
+- [x] Query newly registered Leads.
+- [x] Update a Lead through an MCP tool.
+- [x] Verify the change in the CRM interface.
+- [x] Reject unauthorized operations.
 
 ---
 
@@ -430,20 +523,24 @@ Verify the updated status in the CRM.
 
 ## 10. Final Deliverables
 
-- [ ] Minimal Next.js CRM with Tailwind CSS.
-- [ ] Public lead capture landing page.
-- [ ] Working Lead registration API.
-- [ ] PostgreSQL database.
-- [ ] Salesforce Bulk API integration.
-- [ ] Salesforce CDC consumer.
-- [ ] Functional MCP server.
+- [x] Minimal Next.js CRM with Tailwind CSS.
+- [x] Public lead capture landing page.
+- [x] Working Lead registration API.
+- [x] PostgreSQL database.
+- [x] Salesforce Bulk API integration.
+- [x] Salesforce CDC consumer.
+- [x] Functional MCP server.
 - [ ] AI agent connected to CRM through MCP.
-- [ ] Basic automated tests.
-- [ ] Docker Compose environment.
-- [ ] Architecture diagram.
-- [ ] README and setup instructions.
-- [ ] Technical findings and limitations.
-- [ ] Recommendations for production migration.
+
+> ⚠️ Same gap as §6 "Test using an MCP-compatible AI client": MCP is proven over raw JSON-RPC, not
+> with a real AI client attached.
+
+- [x] Basic automated tests.
+- [x] Docker Compose environment.
+- [x] Architecture diagram.
+- [x] README and setup instructions.
+- [x] Technical findings and limitations.
+- [x] Recommendations for production migration.
 
 ---
 
@@ -463,6 +560,12 @@ Verify the updated status in the CRM.
 12. Keep Salesforce synchronized records and locally captured Leads clearly distinguishable.
 
 **Focus on technical feasibility rather than code volume or visual polish.**
+
+> ⚠️ Rule 8 ("use real Salesforce APIs for migration and CDC") was **not satisfied**: no real
+> Salesforce API was called. Everything Salesforce-shaped ran against the local emulator — see §3
+> above and [`FINDINGS.md`](FINDINGS.md) §1–2. Rule 11 was upheld: neither the audit nor this
+> rewrite found a fabricated result. Capabilities 1, 2, 4 and 5 are demonstrated end to end against
+> the emulator; capability 3 is demonstrated for clean disconnects only (open finding P0-2).
 
 ## Definition of Success
 
