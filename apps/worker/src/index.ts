@@ -12,6 +12,7 @@
  */
 import { closePool, listSyncRuns } from '@poc/core';
 import {
+  CdcConsumer,
   reconcile,
   runBulkExtract,
   startConsumer,
@@ -138,6 +139,16 @@ async function runReconcile(): Promise<boolean> {
 
 /** Foreground consumer; resolves only when a signal stops it. */
 async function runCdc(signal: Promise<string>): Promise<void> {
+  // A container restart that kills node before its SIGTERM handler runs leaves a
+  // `cdc` sync run `running` forever, which would make the dashboard claim the
+  // worker is syncing when it is not. This is the one place where "every
+  // `running` cdc run belongs to a dead process" holds by construction.
+  try {
+    await CdcConsumer.reapOrphanSyncRuns((line) => console.log(line));
+  } catch (error) {
+    logError(`could not reap orphaned cdc sync runs: ${describe(error)}`);
+  }
+
   const consumer = await startConsumer({
     onEvent: (info: CdcEventLog) => {
       // The compact `[cdc]` line is printed by the consumer itself; keep a
@@ -156,6 +167,7 @@ async function runCdc(signal: Promise<string>): Promise<void> {
     `cdc stopped: events=${consumer.stats.events} applied=${consumer.stats.applied} ` +
       `skipped_stale=${consumer.stats.skipped_stale} ignored=${consumer.stats.ignored} ` +
       `failed=${consumer.stats.failed} duplicates=${consumer.stats.duplicates} ` +
+      `blocked=${consumer.stats.blocked} held=${consumer.stats.held} ` +
       `reconnects=${consumer.stats.reconnects}`,
   );
 }

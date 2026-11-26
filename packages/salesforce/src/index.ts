@@ -5,6 +5,7 @@
  *   http.ts       REST client (bearer token, 401 retry once)
  *   bulk.ts       Bulk API 2.0 query jobs → `applySalesforceBatch`
  *   cdc.ts        Pub/Sub gRPC + Avro CDC consumer (checkpoints, dedupe, replay)
+ *   redrive.ts    re-apply dead-lettered `cdc_events.status='failed'` rows
  *   reconcile.ts  count/newest-timestamp comparison per object
  *   csv.ts        Bulk result CSV parsing
  *   objects.ts    SOQL field lists + extraction order
@@ -16,4 +17,5 @@ export * from './objects';
 export * from './csv';
 export * from './bulk';
 export * from './cdc';
+export * from './redrive';
 export * from './reconcile';

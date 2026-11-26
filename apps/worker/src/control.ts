@@ -9,6 +9,7 @@
  *   GET  /health         -> { status, mode, busy, lastBulkRun }
  *   POST /run/bulk       -> run one Bulk API 2.0 extraction, answer with the summary
  *   POST /run/reconcile  -> run one reconciliation pass, answer with the report
+ *   POST /run/redrive    -> re-apply dead-lettered CDC events, answer with the summary
  *
  * Every route requires `Authorization: Bearer ${CRM_API_TOKEN}` — this is an
  * operational control plane, not an internal CRM route, but the POC has one
@@ -22,12 +23,18 @@
  * under `lastBulkRun` for polling/observability. A second request while a run
  * is in flight answers `409` (single-flight lock: Bulk API jobs are expensive
  * and two concurrent extractions would race on the same rows).
+ *
+ * `POST /run/redrive` re-applies `cdc_events.status='failed'` rows (audit P0-2 —
+ * a poison event blocks its topic's checkpoint until it lands). It answers `200`
+ * with `{ attempted, applied, skipped_stale, ignored, still_failing }`: a
+ * non-zero `still_failing` is a *report*, not an HTTP error — the event is still
+ * broken, and the caller is expected to fix the data and redrive again.
  */
 import { createHash, timingSafeEqual } from 'node:crypto';
 
 import express, { type Express, type Request, type Response } from 'express';
 import { listSyncRuns } from '@poc/core';
-import { reconcile, runBulkExtract, type BulkExtractSummary } from '@poc/salesforce';
+import { reconcile, redriveFailedEvents, runBulkExtract, type BulkExtractSummary } from '@poc/salesforce';
 
 export type ControlMode = string;
 
@@ -84,7 +91,7 @@ export function createControlApp(options: ControlServerOptions): {
   const token = (options.token ?? process.env.CRM_API_TOKEN ?? '').trim();
   const log = options.log ?? ((line: string) => console.log(`[control] ${line}`));
   const state: { lastBulkRun: BulkRunHealth | null } = { lastBulkRun: null };
-  let busy: 'bulk' | 'reconcile' | null = null;
+  let busy: 'bulk' | 'reconcile' | 'redrive' | null = null;
 
   const app = express();
   app.disable('x-powered-by');
@@ -208,9 +215,44 @@ export function createControlApp(options: ControlServerOptions): {
     }
   });
 
+  app.post('/run/redrive', async (req: Request, res: Response): Promise<void> => {
+    if (busy) {
+      json(res, 409, {
+        error: { code: 'conflict', message: `a ${busy} run is already in progress` },
+      });
+      return;
+    }
+    busy = 'redrive';
+    const requested = Number((req.body as { limit?: unknown } | undefined)?.limit);
+    const limit = Number.isFinite(requested) && requested > 0 ? Math.trunc(requested) : undefined;
+    log(`redrive requested limit=${limit ?? 'default'}`);
+    try {
+      const summary = await redriveFailedEvents({
+        ...(limit === undefined ? {} : { limit }),
+        log: (line: string) => console.log(line),
+      });
+      log(
+        `redrive done attempted=${summary.attempted} applied=${summary.applied} ` +
+          `skipped_stale=${summary.skipped_stale} ignored=${summary.ignored} ` +
+          `still_failing=${summary.still_failing}`,
+      );
+      json(res, 200, summary);
+    } catch (error) {
+      log(`redrive crashed: ${message(error)}`);
+      json(res, 500, {
+        error: { code: 'internal', message: `redrive failed: ${message(error)}` },
+      });
+    } finally {
+      busy = null;
+    }
+  });
+
   app.use((_req: Request, res: Response) => {
     json(res, 404, {
-      error: { code: 'not_found', message: 'Use GET /health, POST /run/bulk or POST /run/reconcile.' },
+      error: {
+        code: 'not_found',
+        message: 'Use GET /health, POST /run/bulk, POST /run/reconcile or POST /run/redrive.',
+      },
     });
   });
 

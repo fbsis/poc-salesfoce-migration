@@ -7,14 +7,42 @@
  * Per event, strictly in this order (at-least-once, deduped, replayable):
  *   1. decode the Avro payload with the schema from `GetSchema`
  *   2. `recordCdcEvent(<channel>:<replayId>)`      → duplicate? skip + advance checkpoint
- *   3. `applySalesforceRecord` / `deleteSalesforceRecord`
+ *   3. `applySalesforceRecord` / `deleteSalesforceRecord` (bounded retry, see below)
  *   4. `markCdcEventProcessed(outcome)` with `latency_ms = now - commitTimestamp`
  *   5. `saveCheckpoint(channel, replayId)` **after** the row is written
  *
+ * ## Failure semantics (audit P0-2)
+ *
+ * An apply that throws is retried **in-process** up to `APPLY_ATTEMPTS` times
+ * (250 ms / 1 s / 3 s backoff). If every attempt fails the event is dead-lettered
+ * (`cdc_events.status='failed'`, payload + error kept) and the checkpoint is
+ * **not** advanced: the topic's stream is cancelled, the checkpoint row is left
+ * at `status='error'`, and an unmissable `[cdc][ALERT]` line is printed.
+ * `runTopic` then reconnects after its normal backoff and re-subscribes from that
+ * same checkpoint, which re-delivers the poison event.
+ *
+ * That is **deliberate head-of-line blocking**: one unappliable event stops its
+ * topic until an operator fixes the data (or the code) and the event applies, or
+ * `redriveFailedEvents()` re-applies it out of band. Bounded and safe beats
+ * silent loss: nothing is ever skipped, at the cost of that topic lagging while
+ * the event is broken. Events *behind* the blocked replay id are dropped
+ * unrecorded and re-fetched by the replay, so the checkpoint can never jump over
+ * the poison event. Duplicates are still skipped *and* advanced — a duplicate
+ * means "already applied" — except when the stored row is itself `failed`,
+ * in which case it is treated as a retry (that is the poison event coming back).
+ *
  * Reconnect: exponential backoff with jitter (1s → 30s cap) resuming from the
  * persisted checkpoint. `error` never escapes the process; `end` reconnects.
+ *
+ * ## Sync runs (audit P1-3)
+ *
+ * One `cdc` row in `sync_runs` per consumer lifetime: opened on `start()`, closed
+ * on `stop()` (or after every topic has been disconnected for ~30 s), and a new
+ * one opened on the next live subscription, so `/api/crm/sync/status` never
+ * reports "Idle" while the consumer is up.
  */
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
@@ -24,8 +52,12 @@ import {
   deleteSalesforceRecord,
   getCheckpoint,
   markCdcEventProcessed,
+  query,
+  queryOne,
   recordCdcEvent,
   saveCheckpoint,
+  startSyncRun,
+  finishSyncRun,
   type ChangeType,
   type SalesforceRecord,
 } from '@poc/core';
@@ -48,6 +80,21 @@ const PROTO_OPTIONS: protoLoader.Options = {
 };
 
 const DEFAULT_BATCH_SIZE = 100;
+
+/**
+ * In-process retry budget for one apply (audit P0-2). Three attempts total; the
+ * delays sit between them. Short on purpose: a transient blip (deadlock, pool
+ * timeout, a slow `linkOrphanRecords`) recovers silently, anything structural
+ * blocks the topic instead of dropping the change.
+ */
+export const APPLY_RETRY_DELAYS_MS: readonly number[] = [250, 1_000, 3_000];
+export const APPLY_ATTEMPTS = APPLY_RETRY_DELAYS_MS.length;
+
+/** Close the `cdc` sync run once every topic has been down this long. */
+const SYNC_RUN_IDLE_CLOSE_MS = Number(process.env.CDC_RUN_IDLE_CLOSE_MS ?? 30_000);
+const SYNC_RUN_WATCHDOG_MS = 5_000;
+/** Cap on the per-run latency reservoir (p50/max of `latency_ms`). */
+const MAX_LATENCY_SAMPLES = 10_000;
 
 // --------------------------------------------------------------- proto loading
 
@@ -228,6 +275,10 @@ export interface ConsumerStats {
   failed: number;
   duplicates: number;
   reconnects: number;
+  /** Events that exhausted the retry budget and blocked their topic. */
+  blocked: number;
+  /** Events dropped (not recorded) because they sit behind a blocked event. */
+  held: number;
   lastEventAt: string | null;
   lastReplayId: string | null;
 }
@@ -242,6 +293,14 @@ export interface ConsumerOptions {
   batchSize?: number;
   minBackoffMs?: number;
   maxBackoffMs?: number;
+  /**
+   * Close the `cdc` sync run once every topic has been disconnected this long
+   * (default `CDC_RUN_IDLE_CLOSE_MS` or 30 000 ms). A fresh run opens on the
+   * next live subscription.
+   */
+  syncRunIdleCloseMs?: number;
+  /** How often the idle check runs (default 5 000 ms). */
+  syncRunWatchdogMs?: number;
 }
 
 interface Runner {
@@ -258,6 +317,14 @@ interface Runner {
   /** Resolves on the first FetchResponse (i.e. the subscription is live). */
   ready: Promise<void>;
   markReady: () => void;
+  /**
+   * Replay id of the event this topic is blocked on (it could not be applied).
+   * `null` = healthy. Anything **after** it is dropped unrecorded and re-fetched
+   * by the replay, so the checkpoint never jumps over the poison event.
+   */
+  blockedAt: bigint | null;
+  /** When this topic's stream last went down (`null` while connected). */
+  disconnectedAt: number | null;
 }
 
 const DEFAULT_LOG = (line: string) => console.log(line);
@@ -282,6 +349,27 @@ function backoffDelay(attempt: number, minMs: number, maxMs: number): number {
   return Math.max(minMs, Math.min(maxMs, Math.round(exponential * jitter)));
 }
 
+/**
+ * 
+ */
+
+/**
+ * p50 / max of the per-run `latency_ms` reservoir (`latency_ms` is
+ * `now - ChangeEventHeader.commitTimestamp`, so it includes reconnect backoff).
+ */
+export function summariseLatency(samples: readonly number[]): {
+  p50: number | null;
+  max: number | null;
+  samples: number;
+} {
+  const values = samples.filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
+  if (values.length === 0) return { p50: null, max: null, samples: 0 };
+  const middle = Math.floor(values.length / 2);
+  const p50 =
+    values.length % 2 === 0 ? Math.round((values[middle - 1] + values[middle]) / 2) : values[middle];
+  return { p50, max: values[values.length - 1], samples: values.length };
+}
+
 function isoFromCommit(commitTimestamp: unknown): string {
   const value = Number(commitTimestamp);
   if (Number.isFinite(value) && value > 0) {
@@ -291,10 +379,48 @@ function isoFromCommit(commitTimestamp: unknown): string {
   return new Date().toISOString();
 }
 
+/**
+ * Stored status of an already-recorded CDC event (`null` when unknown).
+ *
+ * Used on the duplicate path: a `failed` row means the event is coming back from
+ * a replay of a blocked checkpoint and must be re-applied, not skipped.
+ *
+ * A tiny read through `@poc/core`'s `queryOne` (the same escape hatch
+ * `reconcile.ts` uses) because `listCdcEvents({status:'failed'})` is paginated
+ * and could miss the event when many are dead-lettered.
+ */
+async function existingCdcEventStatus(eventId: string): Promise<string | null> {
+  const row = await queryOne<{ status: string }>(
+    `SELECT status FROM cdc_events WHERE event_id = $1`,
+    [eventId],
+  );
+  return row?.status ?? null;
+}
+
+/**
+ * Mark a CDC event resolved **and** clear the error text a previous attempt
+ * left behind, so a re-applied / redriven row reads clean.
+ */
+export async function markEventResolved(
+  eventId: string,
+  status: 'applied' | 'skipped_stale' | 'ignored',
+): Promise<void> {
+  await markCdcEventProcessed(eventId, status);
+  await query(
+    `UPDATE cdc_events SET error = NULL WHERE event_id = $1 AND error IS NOT NULL`,
+    [eventId],
+  ).catch(() => undefined);
+}
+
 // ------------------------------------------------------------------ consumer
 
 export class CdcConsumer {
   readonly topics: string[];
+  /**
+   * Identity of this consumer lifetime, stamped into the `cdc` sync run's
+   * `details.instance` so an orphaned run can be traced back to a process.
+   */
+  readonly instanceId = randomUUID();
   readonly stats: ConsumerStats = {
     events: 0,
     applied: 0,
@@ -303,6 +429,8 @@ export class CdcConsumer {
     failed: 0,
     duplicates: 0,
     reconnects: 0,
+    blocked: 0,
+    held: 0,
     lastEventAt: null,
     lastReplayId: null,
   };
@@ -314,7 +442,25 @@ export class CdcConsumer {
   private readonly batchSize: number;
   private readonly minBackoffMs: number;
   private readonly maxBackoffMs: number;
+  private readonly syncRunIdleCloseMs: number;
+  private readonly syncRunWatchdogMs: number;
   private stopped = false;
+
+  // ---- cdc sync run (audit P1-3): one row per consumer lifetime/reconnect ----
+  /** `sync_runs.id` of the currently open `cdc` run, or `null`. */
+  private syncRunId: string | null = null;
+  private syncRunStartedAt = 0;
+  private syncRunsCompleted = 0;
+  /** Serialises open/close so the start/stop race cannot duplicate a run. */
+  private runOps: Promise<void> = Promise.resolve();
+  /** Stats snapshot at run open, so each run reports its own deltas. */
+  private runBaseline = { ...CdcConsumer.zeroCounters() };
+  private latencySamples: number[] = [];
+  private watchdog: NodeJS.Timeout | null = null;
+
+  private static zeroCounters() {
+    return { events: 0, applied: 0, skipped_stale: 0, ignored: 0, failed: 0, duplicates: 0, blocked: 0, held: 0 };
+  }
 
   constructor(options: ConsumerOptions = {}) {
     const topics = [...new Set(options.topics?.length ? options.topics : defaultTopics())].filter(
@@ -330,6 +476,8 @@ export class CdcConsumer {
       options.batchSize ?? Number(process.env.PUBSUB_NUM_REQUESTED ?? DEFAULT_BATCH_SIZE);
     this.minBackoffMs = options.minBackoffMs ?? backoff.minMs;
     this.maxBackoffMs = options.maxBackoffMs ?? backoff.maxMs;
+    this.syncRunIdleCloseMs = options.syncRunIdleCloseMs ?? SYNC_RUN_IDLE_CLOSE_MS;
+    this.syncRunWatchdogMs = options.syncRunWatchdogMs ?? SYNC_RUN_WATCHDOG_MS;
     this.runners = topics.map((topic) => {
       let markReady = () => undefined as void;
       const ready = new Promise<void>((resolve) => {
@@ -348,6 +496,8 @@ export class CdcConsumer {
         connected: false,
         ready,
         markReady,
+        blockedAt: null,
+        disconnectedAt: null,
       };
     });
   }
@@ -376,6 +526,11 @@ export class CdcConsumer {
   /** Start one reconnect loop per topic. Resolves once the loops are running. */
   start(): void {
     if (this.stopped) throw new Error('consumer already stopped');
+    // One `cdc` sync run per consumer lifetime (audit P1-3): the dashboard reads
+    // `sync_runs` to decide between "Running" and "Idle".
+    this.openSyncRun();
+    this.watchdog = setInterval(() => this.checkSyncRunIdle(), this.syncRunWatchdogMs);
+    this.watchdog.unref?.();
     for (const runner of this.runners) {
       const loop = this.runTopic(runner);
       this.loops.push(loop);
@@ -390,6 +545,10 @@ export class CdcConsumer {
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    if (this.watchdog) {
+      clearInterval(this.watchdog);
+      this.watchdog = null;
+    }
     for (const runner of this.runners) {
       runner.stopped = true;
       runner.wake?.();
@@ -401,7 +560,144 @@ export class CdcConsumer {
     }
     await Promise.allSettled(this.loops);
     await Promise.allSettled(this.runners.map((runner) => runner.queue));
+    await this.closeSyncRun('consumer stopped');
     this.log('[cdc] consumer stopped');
+  }
+
+  // --------------------------------------------------------- cdc sync runs
+
+  /** Open the `cdc` sync run if none is open. Fire-and-forget, serialised. */
+  private openSyncRun(): void {
+    this.runOps = this.runOps.then(async () => {
+      if (this.stopped || this.syncRunId !== null) return;
+      try {
+        const id = await startSyncRun('cdc', {
+          source: 'pubsub',
+          instance: this.instanceId,
+          topics: this.topics,
+          started_at: new Date().toISOString(),
+        });
+        this.syncRunId = id;
+        this.syncRunStartedAt = Date.now();
+        this.runBaseline = { ...this.currentCounters() };
+        this.latencySamples = [];
+        this.log(`[cdc] sync_run=${id} open kind=cdc topics=${this.topics.length}`);
+      } catch (error) {
+        this.log(`[cdc] could not open a cdc sync run: ${this.describe(error)}`);
+      }
+    });
+  }
+
+  /**
+   * Close a `cdc` sync run left `running` by a **dead** consumer process.
+   *
+   * This is deliberately *not* called automatically: a second consumer in the
+   * same process (or a test process sharing the database) must not close the
+   * run of a live one. `apps/worker` calls it once at startup, where "any
+   * `running` cdc run is a previous incarnation" holds by construction.
+   */
+  static async reapOrphanSyncRuns(log: (line: string) => string | void = DEFAULT_LOG): Promise<number> {
+    const reaped = await query<{ id: string }>(
+      `UPDATE sync_runs
+          SET status = 'failed',
+              finished_at = now(),
+              error = COALESCE(error, 'orphaned: the consumer that owned this run is gone'),
+              details = COALESCE(details, '{}'::jsonb)
+                        || jsonb_build_object('close_reason', 'orphaned')
+        WHERE kind = 'cdc' AND status = 'running'
+        RETURNING id`,
+    );
+    if (reaped.length > 0) {
+      log(`[cdc] reaped ${reaped.length} orphaned cdc sync run(s) from a previous consumer`);
+    }
+    return reaped.length;
+  }
+
+  /** Close the open `cdc` sync run with this run's own counters and latency. */
+  private closeSyncRun(reason: string): Promise<void> {
+    this.runOps = this.runOps.then(async () => {
+      const id = this.syncRunId;
+      if (id === null) return;
+      this.syncRunId = null;
+      this.syncRunsCompleted += 1;
+
+      const now = this.currentCounters();
+      const base = this.runBaseline;
+      const delta = {
+        events: now.events - base.events,
+        applied: now.applied - base.applied,
+        skipped_stale: now.skipped_stale - base.skipped_stale,
+        ignored: now.ignored - base.ignored,
+        failed: now.failed - base.failed,
+        duplicates: now.duplicates - base.duplicates,
+        blocked: now.blocked - base.blocked,
+        held: now.held - base.held,
+      };
+      const latency = summariseLatency(this.latencySamples);
+      const details = {
+        source: 'pubsub',
+        topics: this.topics,
+        applied: delta.applied,
+        skipped_stale: delta.skipped_stale,
+        ignored: delta.ignored,
+        failed: delta.failed,
+        duplicates: delta.duplicates,
+        blocked: delta.blocked,
+        held: delta.held,
+        events: delta.events,
+        latency_ms: { p50: latency.p50, max: latency.max, samples: latency.samples },
+        duration_ms: Date.now() - this.syncRunStartedAt,
+        reconnects: this.stats.reconnects,
+        close_reason: reason,
+      };
+      const failed = delta.failed > 0;
+      this.latencySamples = [];
+      try {
+        await finishSyncRun(id, {
+          status: failed ? 'failed' : 'success',
+          records_read: delta.events,
+          records_written: delta.applied,
+          ...(failed
+            ? {
+                error:
+                  `${delta.failed} CDC event(s) could not be applied after ` +
+                  `${APPLY_ATTEMPTS} attempts (checkpoint blocked)`,
+              }
+            : {}),
+          details,
+        });
+        this.log(
+          `[cdc] sync_run=${id} closed status=${failed ? 'failed' : 'success'} (${reason}) ` +
+            `read=${delta.events} written=${delta.applied} failed=${delta.failed} ` +
+            `latency_p50=${latency.p50 ?? 'n/a'} latency_max=${latency.max ?? 'n/a'}`,
+        );
+      } catch (error) {
+        this.log(`[cdc] could not close cdc sync run ${id}: ${this.describe(error)}`);
+      }
+    });
+    return this.runOps;
+  }
+
+  /** Nothing has been subscribed for a while → this run is over, close it. */
+  private checkSyncRunIdle(): void {
+    if (this.stopped || this.syncRunId === null) return;
+    const now = Date.now();
+    const down = this.runners.every(
+      (runner) =>
+        runner.disconnectedAt !== null && now - runner.disconnectedAt >= this.syncRunIdleCloseMs,
+    );
+    if (down) {
+      this.log(
+        `[cdc] every topic has been disconnected for ≥${Math.round(this.syncRunIdleCloseMs / 1000)}s ` +
+          `— closing the cdc sync run (a new one opens on the next successful subscribe)`,
+      );
+      void this.closeSyncRun('disconnected');
+    }
+  }
+
+  private currentCounters() {
+    const { events, applied, skipped_stale, ignored, failed, duplicates, blocked, held } = this.stats;
+    return { events, applied, skipped_stale, ignored, failed, duplicates, blocked, held };
   }
 
   // ------------------------------------------------------------ topic loop
@@ -418,6 +714,7 @@ export class CdcConsumer {
       }
       if (runner.stopped) break;
 
+      runner.disconnectedAt = runner.disconnectedAt ?? Date.now();
       runner.attempt += 1;
       this.stats.reconnects += 1;
       const delay = backoffDelay(runner.attempt - 1, this.minBackoffMs, this.maxBackoffMs);
@@ -452,6 +749,7 @@ export class CdcConsumer {
         if (settled) return;
         settled = true;
         runner.connected = false;
+        runner.disconnectedAt = runner.disconnectedAt ?? Date.now();
         runner.stream = null;
         runner.client = null;
         try {
@@ -476,8 +774,15 @@ export class CdcConsumer {
 
           active.on('data', (response: any) => {
             runner.connected = true;
-            runner.attempt = 0;
+            // A blocked topic keeps escalating its reconnect backoff (1s → 30s)
+            // instead of hammering the poison event every second; the reset
+            // happens as soon as that event finally applies.
+            if (runner.blockedAt === null) runner.attempt = 0;
+            runner.disconnectedAt = null;
             runner.markReady();
+            // A live subscription means this consumer is syncing again: the
+            // first subscribe opened the run, a reconnect reopens a fresh one.
+            this.openSyncRun();
             const events: any[] = Array.isArray(response?.events) ? response.events : [];
             for (const event of events) {
               runner.queue = runner.queue.then(() => this.handleEvent(runner, event));
@@ -501,10 +806,15 @@ export class CdcConsumer {
             // A cancelled stream during shutdown is expected, not an incident.
             if (!runner.stopped) {
               this.log(`[cdc] ${runner.topic} stream error: ${this.describe(error)}`);
-              void saveCheckpoint(runner.channel, null, {
-                status: 'error',
-                error: this.describe(error).slice(0, 500),
-              }).catch(() => undefined);
+              // While blocked we cancelled the stream ourselves: keep the
+              // actionable "apply failed after N attempts" text on the row
+              // instead of overwriting it with `CANCELLED on client`.
+              if (runner.blockedAt === null) {
+                void saveCheckpoint(runner.channel, null, {
+                  status: 'error',
+                  error: this.describe(error).slice(0, 500),
+                }).catch(() => undefined);
+              }
             }
             finish('error');
           });
@@ -531,6 +841,7 @@ export class CdcConsumer {
           );
         } catch (error) {
           runner.connected = false;
+          runner.disconnectedAt = runner.disconnectedAt ?? Date.now();
           this.log(`[cdc] ${runner.topic} subscribe failed: ${this.describe(error)}`);
           finish('subscribe-failed');
         }
@@ -553,6 +864,20 @@ export class CdcConsumer {
 
     try {
       replayId = decodeReplayId(consumerEvent?.replayId);
+
+      // Head-of-line guard: this topic is blocked on an earlier replay id that
+      // could not be applied. Drop this event *unrecorded* — the replay from the
+      // (not advanced) checkpoint will fetch it again in order. Recording or
+      // advancing it here would move the checkpoint past the poison event.
+      if (runner.blockedAt !== null && replayId > runner.blockedAt) {
+        this.stats.held += 1;
+        this.log(
+          `[cdc] ${runner.topic} replay=${replayId.toString()} held (topic blocked at ` +
+            `replay=${runner.blockedAt.toString()}, not recorded, will be re-fetched)`,
+        );
+        return;
+      }
+
       const producerEvent = consumerEvent?.event ?? {};
       const schemaId = String(producerEvent.schemaId ?? '');
       const schema = await fetchSchema(runner.client, schemaId).catch(
@@ -593,40 +918,77 @@ export class CdcConsumer {
       });
 
       if (duplicate) {
-        this.stats.duplicates += 1;
-        await this.advanceCheckpoint(runner, replayId, header);
-        this.emitLog({ topic: runner.topic, channel, object: objectName, changeType, sfId, replayId: replayId.toString(), latencyMs, outcome: 'duplicate', eventId });
-        return;
+        // A duplicate normally means "already applied" → skip and advance. But a
+        // *failed* row means this is the poison event coming back on a replay:
+        // re-driving it is the whole point of not advancing the checkpoint.
+        const stored = await existingCdcEventStatus(eventId);
+        if (stored !== 'failed') {
+          this.stats.duplicates += 1;
+          await this.advanceCheckpoint(runner, replayId, header);
+          this.clearBlockIfReached(runner, replayId);
+          this.emitLog({ topic: runner.topic, channel, object: objectName, changeType, sfId, replayId: replayId.toString(), latencyMs, outcome: 'duplicate', eventId });
+          return;
+        }
+        this.log(
+          `[cdc] ${runner.topic} replay=${replayId.toString()} was recorded as failed ` +
+            `(${eventId}) — retrying it instead of skipping as duplicate`,
+        );
       }
 
+      // Bounded in-process retry (audit P0-2). Transient blips recover here; a
+      // structural failure falls through to the head-of-line block below.
       let outcome: CdcOutcome = 'ignored';
-      try {
-        outcome =
-          changeType === 'DELETE'
-            ? (await deleteSalesforceRecord(objectName, sfId)).outcome
-            : (await applySalesforceRecord(objectName, changeType, record)).outcome;
-      } catch (error) {
-        const message = this.describe(error);
-        this.stats.failed += 1;
-        await markCdcEventProcessed(eventId, 'failed', { error: message.slice(0, 1000) }).catch(
-          () => undefined,
-        );
-        // Advance anyway: the event is already recorded as failed (dead letter),
-        // and a poison event must not block the stream forever.
-        await this.advanceCheckpoint(runner, replayId, header);
-        this.emitLog({ topic: runner.topic, channel, object: objectName, changeType, sfId, replayId: replayId.toString(), latencyMs, outcome: 'failed', eventId }, message);
+      let applyError: string | null = null;
+      const applyOnce = () =>
+        changeType === 'DELETE'
+          ? deleteSalesforceRecord(objectName, sfId).then((result) => result.outcome)
+          : applySalesforceRecord(objectName, changeType, record).then((result) => result.outcome);
+
+      for (let attempt = 1; attempt <= APPLY_ATTEMPTS; attempt += 1) {
+        try {
+          outcome = await applyOnce();
+          applyError = null;
+          break;
+        } catch (error) {
+          applyError = this.describe(error);
+          this.log(
+            `[cdc][RETRY] topic=${runner.topic} replay=${replayId.toString()} ` +
+              `${objectName} ${changeType} ${sfId || '(no id)'} ` +
+              `attempt=${attempt}/${APPLY_ATTEMPTS} error=${applyError.slice(0, 200)}`,
+          );
+          if (attempt < APPLY_ATTEMPTS) {
+            await sleepUnlessStopped(runner, APPLY_RETRY_DELAYS_MS[attempt - 1] ?? 3_000);
+          }
+        }
+      }
+
+      if (applyError !== null) {
+        await this.blockOnFailure(runner, {
+          eventId,
+          replayId,
+          channel,
+          objectName,
+          changeType,
+          sfId,
+          latencyMs,
+          error: applyError,
+        });
         return;
       }
 
       if (outcome === 'applied') this.stats.applied += 1;
       else if (outcome === 'skipped_stale') this.stats.skipped_stale += 1;
       else this.stats.ignored += 1;
+      if (latencyMs !== null && this.latencySamples.length < MAX_LATENCY_SAMPLES) {
+        this.latencySamples.push(latencyMs);
+      }
 
-      await markCdcEventProcessed(eventId, outcome).catch((error: unknown) => {
+      await markEventResolved(eventId, outcome).catch((error: unknown) => {
         this.log(`[cdc] markCdcEventProcessed failed for ${eventId}: ${this.describe(error)}`);
       });
 
       await this.advanceCheckpoint(runner, replayId, header);
+      this.clearBlockIfReached(runner, replayId);
       this.emitLog({
         topic: runner.topic,
         channel,
@@ -654,6 +1016,87 @@ export class CdcConsumer {
     }
   }
 
+  /**
+   * Exhausted the retry budget: dead-letter the event, keep the checkpoint where
+   * it is, and stop this topic's stream so `runTopic` re-subscribes from that
+   * same checkpoint after its normal backoff (deliberate head-of-line blocking).
+   */
+  private async blockOnFailure(
+    runner: Runner,
+    info: {
+      eventId: string;
+      replayId: bigint;
+      channel: string;
+      objectName: string;
+      changeType: ChangeType;
+      sfId: string;
+      latencyMs: number | null;
+      error: string;
+    },
+  ): Promise<void> {
+    this.stats.failed += 1;
+    this.stats.blocked += 1;
+    await markCdcEventProcessed(info.eventId, 'failed', {
+      error: info.error.slice(0, 1000),
+    }).catch((error: unknown) => {
+      this.log(`[cdc] could not dead-letter ${info.eventId}: ${this.describe(error)}`);
+    });
+
+    // Surface the block on the checkpoint row WITHOUT moving `replay_id`
+    // (`saveCheckpoint` keeps the stored replay id when passed `null`).
+    const checkpointError =
+      `apply failed after ${APPLY_ATTEMPTS} attempts, checkpoint NOT advanced ` +
+      `(blocked at replay=${info.replayId.toString()}): ${info.error}`;
+    await saveCheckpoint(runner.channel, null, {
+      status: 'error',
+      error: checkpointError.slice(0, 500),
+    }).catch((error: unknown) => {
+      this.log(`[cdc] could not mark checkpoint ${runner.channel} as error: ${this.describe(error)}`);
+    });
+
+    runner.blockedAt = info.replayId;
+
+    this.log(
+      `[cdc][ALERT] topic=${runner.topic} replay=${info.replayId.toString()} ` +
+        `event=${info.eventId} ${info.objectName} ${info.changeType} ${info.sfId || '(no id)'} ` +
+        `apply failed after ${APPLY_ATTEMPTS} attempts; checkpoint NOT advanced (blocked). ` +
+        `Fix or redrive. last_error=${info.error.slice(0, 300)}`,
+    );
+    this.emitLog(
+      {
+        topic: runner.topic,
+        channel: info.channel,
+        object: info.objectName,
+        changeType: info.changeType,
+        sfId: info.sfId,
+        replayId: info.replayId.toString(),
+        latencyMs: info.latencyMs,
+        outcome: 'failed',
+        eventId: info.eventId,
+      },
+      info.error,
+    );
+
+    // Stop this topic's stream. `runTopic` sees the closed stream, waits its
+    // normal backoff, then re-subscribes from the last good checkpoint — which
+    // re-delivers this very event. Nothing behind it is skipped.
+    try {
+      runner.stream?.cancel();
+    } catch {
+      /* stream already closed */
+    }
+  }
+
+  /** The blocked event finally landed: stop holding the topic back. */
+  private clearBlockIfReached(runner: Runner, replayId: bigint): void {
+    if (runner.blockedAt === null || replayId < runner.blockedAt) return;
+    this.log(
+      `[cdc] ${runner.topic} unblocked (replay=${replayId.toString()} reached the ` +
+        `previously blocked replay=${runner.blockedAt.toString()})`,
+    );
+    runner.blockedAt = null;
+  }
+
   /** Persist the checkpoint only after the event has been applied. */
   private async advanceCheckpoint(
     runner: Runner,
@@ -661,6 +1104,8 @@ export class CdcConsumer {
     header: DecodedChangeEvent['ChangeEventHeader'],
   ): Promise<void> {
     if (replayId <= runner.highestSaved) return;
+    // Defensive: never write a checkpoint past an event we could not apply.
+    if (runner.blockedAt !== null && replayId > runner.blockedAt) return;
     const lastEventAt = isoFromCommit(header?.commitTimestamp);
     try {
       await saveCheckpoint(runner.channel, replayId.toString(), {
@@ -687,9 +1132,7 @@ export class CdcConsumer {
 }
 
 // ----------------------------------------------------------------- singleton
-
 const activeConsumers = new Set<CdcConsumer>();
-
 /** Start consuming. The returned handle exposes `stop()`. */
 export async function startConsumer(options: ConsumerOptions = {}): Promise<CdcConsumer> {
   const consumer = new CdcConsumer(options);
