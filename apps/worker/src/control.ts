@@ -34,7 +34,13 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 
 import express, { type Express, type Request, type Response } from 'express';
 import { listSyncRuns } from '@poc/core';
-import { reconcile, redriveFailedEvents, runBulkExtract, type BulkExtractSummary } from '@poc/salesforce';
+import {
+  discardFailedEvents,
+  reconcile,
+  redriveFailedEvents,
+  runBulkExtract,
+  type BulkExtractSummary,
+} from '@poc/salesforce';
 
 export type ControlMode = string;
 
@@ -91,7 +97,7 @@ export function createControlApp(options: ControlServerOptions): {
   const token = (options.token ?? process.env.CRM_API_TOKEN ?? '').trim();
   const log = options.log ?? ((line: string) => console.log(`[control] ${line}`));
   const state: { lastBulkRun: BulkRunHealth | null } = { lastBulkRun: null };
-  let busy: 'bulk' | 'reconcile' | 'redrive' | null = null;
+  let busy: 'bulk' | 'reconcile' | 'redrive' | 'discard' | null = null;
 
   const app = express();
   app.disable('x-powered-by');
@@ -247,11 +253,57 @@ export function createControlApp(options: ControlServerOptions): {
     }
   });
 
+  /**
+   * Abandon failed events on purpose. Only needed when an event's *data* can
+   * never be applied (a poison payload); it moves the checkpoint past it so the
+   * topic drains. The record is NOT applied — say so in the report.
+   */
+  app.post('/run/discard', async (req: Request, res: Response): Promise<void> => {
+    if (busy) {
+      json(res, 409, {
+        error: { code: 'conflict', message: `a ${busy} run is already in progress` },
+      });
+      return;
+    }
+    const body = req.body as { event_ids?: unknown } | undefined;
+    const raw = Array.isArray(body?.event_ids) ? body.event_ids : [];
+    const eventIds = raw.filter((value): value is string => typeof value === 'string' && value.length > 0);
+    if (eventIds.length === 0) {
+      json(res, 400, {
+        error: {
+          code: 'validation_error',
+          message: 'Body must be {"event_ids": ["<channel>:<replayId>", ...]}',
+        },
+      });
+      return;
+    }
+    busy = 'discard';
+    log(`discard requested for ${eventIds.length} event(s)`);
+    try {
+      const summary = await discardFailedEvents({
+        eventIds,
+        log: (line: string) => console.log(line),
+      });
+      log(
+        `discard done discarded=${summary.discarded.length} not_found=${summary.not_found.length}`,
+      );
+      json(res, 200, summary);
+    } catch (error) {
+      log(`discard crashed: ${message(error)}`);
+      json(res, 500, {
+        error: { code: 'internal', message: `discard failed: ${message(error)}` },
+      });
+    } finally {
+      busy = null;
+    }
+  });
+
   app.use((_req: Request, res: Response) => {
     json(res, 404, {
       error: {
         code: 'not_found',
-        message: 'Use GET /health, POST /run/bulk, POST /run/reconcile or POST /run/redrive.',
+        message:
+          'Use GET /health, POST /run/bulk, POST /run/reconcile, POST /run/redrive or POST /run/discard.',
       },
     });
   });

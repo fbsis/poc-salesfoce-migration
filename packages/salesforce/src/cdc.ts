@@ -51,6 +51,7 @@ import {
   applySalesforceRecord,
   deleteSalesforceRecord,
   getCheckpoint,
+  listCdcEvents,
   markCdcEventProcessed,
   query,
   queryOne,
@@ -836,9 +837,26 @@ export class CdcConsumer {
               `replay=${previous > 0n ? previous.toString() : 'none'} num_requested=${this.batchSize}`,
           );
 
-          await saveCheckpoint(runner.channel, null, { status: 'connected', error: '' }).catch(
-            () => undefined,
+          // Do not clear the error state while a dead-lettered event still blocks
+          // this channel: the operator has to see it on the sync card, and a
+          // reconnect alone must not make the incident look resolved.
+          const blocking = await listCdcEvents({ status: 'failed', limit: 200 }).catch(
+            () => [],
           );
+          const blocked = blocking.filter(
+            (event: { channel: string }) => event.channel === runner.channel,
+          );
+          if (blocked.length > 0) {
+            const oldest = blocked[blocked.length - 1]!;
+            await saveCheckpoint(runner.channel, null, {
+              status: 'error',
+              error: `blocked by ${blocked.length} failed event(s), oldest replay ${String(oldest.replay_id)}`,
+            }).catch(() => undefined);
+          } else {
+            await saveCheckpoint(runner.channel, null, { status: 'connected', error: '' }).catch(
+              () => undefined,
+            );
+          }
         } catch (error) {
           runner.connected = false;
           runner.disconnectedAt = runner.disconnectedAt ?? Date.now();

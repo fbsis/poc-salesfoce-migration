@@ -31,7 +31,10 @@
 import {
   applySalesforceRecord,
   deleteSalesforceRecord,
+  getCheckpoint,
   listCdcEvents,
+  markCdcEventProcessed,
+  saveCheckpoint,
   type ChangeType,
   type SalesforceRecord,
 } from '@poc/core';
@@ -122,5 +125,97 @@ export async function redriveFailedEvents(options: RedriveOptions = {}): Promise
       `still_failing=${summary.still_failing}`,
   );
 
+  return summary;
+}
+
+// ---------------------------------------------------------------- discarding
+
+export interface DiscardOptions {
+  /** `cdc_events.event_id` values the operator has decided to abandon. */
+  eventIds: string[];
+  log?: (line: string) => void;
+}
+
+export interface DiscardSummary {
+  /** Event ids that were still `failed` and are now `ignored`. */
+  discarded: string[];
+  /** Ids that were not found among the failed rows (already resolved, typo, …). */
+  not_found: string[];
+  /** Channel → replay id the checkpoint was moved to (null when nothing moved). */
+  checkpoint_advanced: Record<string, string | null>;
+}
+
+function toReplayString(replayId: unknown): string | null {
+  if (replayId === null || replayId === undefined || replayId === '') return null;
+  return String(replayId);
+}
+
+/**
+ * Abandon failed events on purpose.
+ *
+ * `redriveFailedEvents()` only helps when the *data* can now be applied. A
+ * payload that is permanently unpalatable (an unmapped `StageName` still sitting
+ * in an old event, a constraint that will never be satisfied) can only be
+ * dropped — otherwise head-of-line blocking stalls that topic forever.
+ *
+ * Discarding is explicit, per event id, logged, and auditable: the row stays in
+ * `cdc_events` as `ignored` with the reason, and the checkpoint is moved past it
+ * (never backwards) so the topic can drain. **The record that event described is
+ * not applied** — the next full extraction or a corrected `UPDATE` from
+ * Salesforce is what repairs the row. That is the tradeoff the operator is
+ * accepting by calling this.
+ */
+export async function discardFailedEvents(options: DiscardOptions): Promise<DiscardSummary> {
+  const log = options.log ?? ((line: string) => console.log(line));
+  const summary: DiscardSummary = { discarded: [], not_found: [], checkpoint_advanced: {} };
+
+  if (options.eventIds.length === 0) {
+    log('[discard] no event ids given');
+    return summary;
+  }
+
+  const failed = await listCdcEvents({ status: 'failed', limit: 200 });
+  const byId = new Map(failed.map((event) => [event.event_id, event]));
+
+  for (const eventId of options.eventIds) {
+    const event = byId.get(eventId);
+    if (!event) {
+      summary.not_found.push(eventId);
+      log(`[discard] ${eventId} not found among failed events (already resolved?)`);
+      continue;
+    }
+
+    await markCdcEventProcessed(eventId, 'ignored', {
+      error: 'discarded by operator (event abandoned; the record was not applied)',
+    });
+    summary.discarded.push(eventId);
+    log(`[discard] ${eventId} ${event.object_name} ${event.change_type} abandoned`);
+
+    const replay = toReplayString(event.replay_id);
+    if (replay === null) continue;
+
+    const checkpoint = await getCheckpoint(event.channel);
+    const current = checkpoint?.replay_id ? BigInt(checkpoint.replay_id) : null;
+    if (current !== null && current >= BigInt(replay)) {
+      summary.checkpoint_advanced[event.channel] = checkpoint?.replay_id ?? null;
+      log(
+        `[discard] ${event.channel} checkpoint already at ${checkpoint?.replay_id} ` +
+          `(>= ${replay}), not moved`,
+      );
+      continue;
+    }
+
+    await saveCheckpoint(event.channel, replay, {
+      status: 'connected',
+      error: `discarded ${eventId} by operator`,
+    });
+    summary.checkpoint_advanced[event.channel] = replay;
+    log(`[discard] ${event.channel} checkpoint advanced to ${replay}`);
+  }
+
+  log(
+    `[discard] done discarded=${summary.discarded.length} ` +
+      `not_found=${summary.not_found.length}`,
+  );
   return summary;
 }
