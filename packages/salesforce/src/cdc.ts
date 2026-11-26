@@ -847,12 +847,26 @@ export class CdcConsumer {
             (event: { channel: string }) => event.channel === runner.channel,
           );
           if (blocked.length > 0) {
+            // Derive the block from the database, never from memory: an operator
+            // redrive or discard resolves the row, and the next subscribe must
+            // clear the block or the topic would stay frozen until a restart.
             const oldest = blocked[blocked.length - 1]!;
+            runner.blockedAt =
+              oldest.replay_id === null || oldest.replay_id === undefined
+                ? runner.blockedAt
+                : BigInt(String(oldest.replay_id));
             await saveCheckpoint(runner.channel, null, {
               status: 'error',
               error: `blocked by ${blocked.length} failed event(s), oldest replay ${String(oldest.replay_id)}`,
             }).catch(() => undefined);
           } else {
+            if (runner.blockedAt !== null) {
+              this.log(
+                `[cdc] ${runner.topic} unblocked (no failed events remain at ` +
+                  `replay=${runner.blockedAt.toString()}), resuming`,
+              );
+            }
+            runner.blockedAt = null;
             await saveCheckpoint(runner.channel, null, { status: 'connected', error: '' }).catch(
               () => undefined,
             );
