@@ -8,3 +8,11 @@ docs
 .pnpm-store
 dist
 .tmp
+# Never bake secrets into an image layer (PRODUCTION-DOCKER.md §10 item 16).
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+salesforce-credentials.json
