@@ -175,7 +175,13 @@ describe('salesforce ingest', () => {
     );
     expect((await findAccount(id))?.name).toBe('Updated');
 
-    track(await applySalesforceRecord('Account', 'UNDELETE', { Id: id, Name: 'Undeleted' }));
+    track(
+      await applySalesforceRecord('Account', 'UNDELETE', {
+        Id: id,
+        Name: 'Undeleted',
+        SystemModstamp: '2025-01-02T00:00:00Z',
+      }),
+    );
     expect((await findAccount(id))?.name).toBe('Undeleted');
 
     const deleted = await deleteSalesforceRecord('Account', id);
@@ -286,9 +292,11 @@ describe('salesforce ingest', () => {
     );
     expect(account.id).toBeTruthy();
 
-    const linked = await linkOrphanRecords();
-    expect(linked.contacts).toBeGreaterThanOrEqual(1);
-    expect(linked.opportunities).toBeGreaterThanOrEqual(1);
+    // The Account upsert itself re-links the orphans (CDC path, P1-4); an
+    // explicit sweep afterwards is still idempotent.
+    const swept = await linkOrphanRecords();
+    expect(swept.contacts).toBeGreaterThanOrEqual(0);
+    expect(swept.opportunities).toBeGreaterThanOrEqual(0);
 
     expect((await findContact(contactSf))?.account_id).toBe(account.id);
     const relinked = await getOpportunity(opportunitySf);
@@ -444,5 +452,232 @@ describe('salesforce ingest', () => {
     expect(row?.name).toBe('From CDC');
     expect(row?.salesforce_updated_at?.toISOString()).toBe(new Date(1_735_000_000_000).toISOString());
     expect((await getAccount(id)).id).toBe(result.id);
+  });
+
+  // ------------------------------------------------------------------- P1-1
+  it('rejects a timestamp-less update of an existing row and keeps data + stamp', async () => {
+    const id = sfid('001', 'notimestamp');
+    track(
+      await applySalesforceRecord('Account', 'CREATE', {
+        Id: id,
+        Name: 'Stamped',
+        Industry: 'Energy',
+        SystemModstamp: '2025-05-01T00:00:00Z',
+      }),
+    );
+    const before = await findAccount(id);
+    expect(before?.salesforce_updated_at?.toISOString()).toBe('2025-05-01T00:00:00.000Z');
+
+    const unstamped = await applySalesforceRecord('Account', 'UPDATE', {
+      Id: id,
+      Name: 'Unstamped',
+      Industry: 'Retail',
+    });
+    expect(unstamped.outcome).toBe('ignored');
+    expect(unstamped.reason).toBe('missing timestamp');
+    expect(unstamped.id).toBeNull();
+
+    const after = await findAccount(id);
+    expect(after?.name).toBe('Stamped');
+    expect(after?.industry).toBe('Energy');
+    expect(after?.salesforce_updated_at?.toISOString()).toBe(
+      before?.salesforce_updated_at?.toISOString(),
+    );
+    expect(await countBySalesforceId('accounts', id)).toBe(1);
+
+    // A first insert with no timestamp is still accepted — and then frozen: the
+    // second timestamp-less write is rejected too.
+    const freshId = sfid('001', 'insertnostamp');
+    const fresh = track(
+      await applySalesforceRecord('Account', 'CREATE', { Id: freshId, Name: 'Unstamped insert' }),
+    );
+    expect(fresh.outcome).toBe('applied');
+    expect((await findAccount(freshId))?.salesforce_updated_at).toBeNull();
+
+    const again = await applySalesforceRecord('Account', 'UPDATE', {
+      Id: freshId,
+      Name: 'Still unstamped',
+    });
+    expect(again.outcome).toBe('ignored');
+    expect(again.reason).toBe('missing timestamp');
+    expect((await findAccount(freshId))?.name).toBe('Unstamped insert');
+  });
+
+  // ------------------------------------------------------------------- P1-2
+  it('guards DELETE with the event timestamp', async () => {
+    const id = sfid('001', 'delguard');
+    track(
+      await applySalesforceRecord('Account', 'CREATE', {
+        Id: id,
+        Name: 'Delete me',
+        SystemModstamp: '2025-06-01T00:00:00Z',
+      }),
+    );
+
+    // Older DELETE event: the newer row survives.
+    const staleDelete = await deleteSalesforceRecord('Account', id, {
+      updatedAt: '2025-05-01T00:00:00Z',
+    });
+    expect(staleDelete.outcome).toBe('skipped_stale');
+    expect(staleDelete.reason).toBe('delete older than local row');
+    expect(staleDelete.id).toBeNull();
+    expect(await countBySalesforceId('accounts', id)).toBe(1);
+
+    // Equal-or-newer DELETE event: deletes (<= so a replay at the same stamp works).
+    const fresh = await deleteSalesforceRecord('Account', id, {
+      updatedAt: '2025-06-01T00:00:00Z',
+    });
+    expect(fresh.outcome).toBe('applied');
+    expect(fresh.reason).toBe('deleted');
+    expect(await countBySalesforceId('accounts', id)).toBe(0);
+
+    // A guarded delete with nothing to delete stays 'ignored'.
+    const missing = await deleteSalesforceRecord('Account', id, {
+      updatedAt: '2025-06-01T00:00:00Z',
+    });
+    expect(missing.outcome).toBe('ignored');
+    expect(missing.reason).toBe('no local row for salesforce id');
+
+    // A row with no stamp is always deletable under the guard.
+    const unstampedId = sfid('001', 'delnullstamp');
+    track(await applySalesforceRecord('Account', 'CREATE', { Id: unstampedId, Name: 'No stamp' }));
+    const nullStamped = await deleteSalesforceRecord('Account', unstampedId, {
+      updatedAt: '2025-01-01T00:00:00Z',
+    });
+    expect(nullStamped.outcome).toBe('applied');
+
+    // The legacy two-argument call is still unguarded.
+    const legacyId = sfid('001', 'dellegacy');
+    track(
+      await applySalesforceRecord('Account', 'CREATE', {
+        Id: legacyId,
+        Name: 'Legacy delete',
+        SystemModstamp: '2030-01-01T00:00:00Z',
+      }),
+    );
+    expect((await deleteSalesforceRecord('Account', legacyId)).outcome).toBe('applied');
+    expect(await countBySalesforceId('accounts', legacyId)).toBe(0);
+  });
+
+  // ------------------------------------------------------------------- P1-4
+  it('re-links a CDC orphan as soon as the Account is applied (no batch involved)', async () => {
+    const accountSf = sfid('001', 'cdclink');
+    const contactSf = sfid('003', 'cdclink');
+
+    track(
+      await applySalesforceRecord('Contact', 'CREATE', {
+        Id: contactSf,
+        LastName: 'CdcOrphan',
+        AccountId: accountSf,
+        SystemModstamp: '2025-01-01T00:00:00Z',
+      }),
+    );
+    expect((await findContact(contactSf))?.account_id).toBeNull();
+
+    const account = track(
+      await applySalesforceRecord('Account', 'UPDATE', {
+        Id: accountSf,
+        Name: 'Cdc Parent',
+        SystemModstamp: '2025-01-01T00:00:01Z',
+      }),
+    );
+    expect(account.outcome).toBe('applied');
+    expect((await findContact(contactSf))?.account_id).toBe(account.id);
+  });
+
+  // ------------------------------------------------------------------- P1-8
+  it('raises a validation error instead of dropping an unmapped StageName', async () => {
+    const badId = sfid('006', 'badstage');
+    await expect(
+      applySalesforceRecord('Opportunity', 'CREATE', {
+        Id: badId,
+        Name: 'Renewal Deal',
+        StageName: 'Closed Won – Renewal',
+        SystemModstamp: '2025-01-01T00:00:00Z',
+      }),
+    ).rejects.toMatchObject({
+      code: 'validation_error',
+      message: 'unmapped StageName: "Closed Won – Renewal"',
+    });
+    expect(await countBySalesforceId('opportunities', badId)).toBe(0);
+
+    // Through a batch the record lands in errors[] and nothing is written.
+    const goodId = sfid('006', 'goodstage');
+    const batch = await applySalesforceBatch('Opportunity', 'CREATE', [
+      {
+        Id: badId,
+        Name: 'Renewal Deal',
+        StageName: 'Closed Won – Renewal',
+        SystemModstamp: '2025-01-01T00:00:00Z',
+      },
+      {
+        Id: goodId,
+        Name: 'Well formed',
+        StageName: 'Proposal',
+        Amount: 1000,
+        SystemModstamp: '2025-01-01T00:00:00Z',
+      },
+    ]);
+    expect(batch.applied).toBe(1);
+    expect(batch.ignored).toBe(0);
+    expect(batch.errors).toHaveLength(1);
+    expect(batch.errors[0]?.id).toBe(badId);
+    expect(batch.errors[0]?.message).toContain('StageName');
+    expect(await countBySalesforceId('opportunities', badId)).toBe(0);
+
+    const good = await queryOne<{ id: string }>(
+      `SELECT id FROM opportunities WHERE salesforce_id = $1`,
+      [goodId],
+    );
+    if (good) createdIds.push(good.id);
+    expect((await getOpportunity(goodId)).stage).toBe('Proposal');
+
+    // An explicit null / absent StageName stays "not carried", not an error.
+    const nullStageId = sfid('006', 'nullstage');
+    const nullStage = track(
+      await applySalesforceRecord('Opportunity', 'CREATE', {
+        Id: nullStageId,
+        Name: 'No stage carried',
+        StageName: null,
+        SystemModstamp: '2025-01-01T00:00:00Z',
+      }),
+    );
+    expect(nullStage.outcome).toBe('applied');
+  });
+
+  it('raises a validation error instead of dropping an unusable Amount', async () => {
+    for (const [label, amount] of [
+      ['out of range', 1e12],
+      ['non finite', 'not-a-number'],
+      ['negative', -5],
+    ] as Array<[string, unknown]>) {
+      const id = sfid('006', `amount${label.replace(/[^a-z]/gi, '')}`);
+      const batch = await applySalesforceBatch('Opportunity', 'CREATE', [
+        {
+          Id: id,
+          Name: `Bad amount ${label}`,
+          StageName: 'Proposal',
+          Amount: amount,
+          SystemModstamp: '2025-01-01T00:00:00Z',
+        },
+      ]);
+      expect(batch.applied, label).toBe(0);
+      expect(batch.errors, label).toHaveLength(1);
+      expect(batch.errors[0]?.message, label).toContain('Amount');
+      expect(await countBySalesforceId('opportunities', id), label).toBe(0);
+    }
+
+    // A finite in-range amount still migrates.
+    const okId = sfid('006', 'amountok');
+    track(
+      await applySalesforceRecord('Opportunity', 'CREATE', {
+        Id: okId,
+        Name: 'Amount ok',
+        StageName: 'Proposal',
+        Amount: '12345.5',
+        SystemModstamp: '2025-01-01T00:00:00Z',
+      }),
+    );
+    expect((await getOpportunity(okId)).amount).toBe('12345.50');
   });
 });

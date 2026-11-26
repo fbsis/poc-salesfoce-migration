@@ -5,13 +5,32 @@
  * Guarantees:
  *  - upsert by `salesforce_id`, idempotent (replaying the same record is a no-op
  *    on content, and an equal timestamp still writes);
- *  - never regress a row: the incoming `SystemModstamp` (fallback
- *    `LastModifiedDate`, then the CDC `ChangeEventHeader.commitTimestamp`) is
- *    compared to the stored `salesforce_updated_at` **in SQL**, so concurrent
- *    workers cannot overwrite newer data with an older snapshot;
+ *  - never regress a row, without exceptions: the incoming `SystemModstamp`
+ *    (fallback `LastModifiedDate`, then the CDC
+ *    `ChangeEventHeader.commitTimestamp`) is compared to the stored
+ *    `salesforce_updated_at` **in SQL**, so concurrent workers cannot overwrite
+ *    newer data with an older snapshot;
+ *  - **a record with no usable timestamp may only INSERT.** Because a
+ *    timestamp-less snapshot cannot be proven newer, it never updates an
+ *    existing row: that write is rejected as `ignored` with
+ *    `reason: 'missing timestamp'` (a first insert with no timestamp is still
+ *    accepted, and its `salesforce_updated_at` stays NULL);
+ *  - DELETE honours the same rule when the caller passes the event timestamp:
+ *    `deleteSalesforceRecord(object, id, { updatedAt })` only removes a row
+ *    whose `salesforce_updated_at` is NULL or not newer than the event, and
+ *    reports `skipped_stale` otherwise. Without the option the delete is
+ *    unconditional (legacy two-argument call);
  *  - a Contact/Opportunity whose parent Account is not known locally is stored
  *    with `account_id = NULL` (never fails) and re-linked by
- *    `linkOrphanRecords()`.
+ *    `linkOrphanRecords()` — after every batch **and** after every applied
+ *    Account upsert, so the CDC path does not leave orphans behind;
+ *  - **unmappable non-null values are never dropped silently.** A non-null
+ *    `StageName` outside the internal enum, or a non-null `Amount` that is not
+ *    a finite number in `[0, 1e12)`, throws a `validationError` naming the
+ *    field and value instead of migrating a row with a default/absent value.
+ *    `applySalesforceBatch` captures that in `errors[]` and writes nothing for
+ *    the record (explicit `null`/absent fields remain "not carried", not an
+ *    error).
  */
 import { query, queryOne, withTransaction } from './db';
 import { validationError } from './errors';
@@ -218,17 +237,33 @@ function mapOpportunityColumns(record: SalesforceRecord): Record<string, unknown
   if (columns.name === null) delete columns.name;
 
   const stage = pick(record, 'StageName');
-  if (stage.present) {
+  if (stage.present && stage.value !== null) {
     const mapped = mapStage(stage.value);
-    if (mapped) columns.stage = mapped;
+    if (!mapped) {
+      // Never drop a non-null enum silently: the row would migrate with the
+      // column default (see the module docs).
+      const value = String(stage.value);
+      throw validationError(`unmapped StageName: "${value}"`, {
+        field: 'StageName',
+        value,
+        expected: OPPORTUNITY_STAGES,
+      });
+    }
+    columns.stage = mapped;
   }
 
   const amount = pick(record, 'Amount');
   if (amount.present && amount.value !== null) {
     const parsed = Number(amount.value);
-    if (Number.isFinite(parsed) && parsed >= 0 && parsed < 1e12) {
-      columns.amount = parsed.toFixed(2);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed >= 1e12) {
+      const value = String(amount.value);
+      throw validationError(`invalid Amount: "${value}"`, {
+        field: 'Amount',
+        value,
+        expected: 'a finite number >= 0 and < 1e12',
+      });
     }
+    columns.amount = parsed.toFixed(2);
   }
 
   const closeDate = pick(record, 'CloseDate');
@@ -394,7 +429,8 @@ interface UpsertArgs {
 
 interface UpsertOutcome {
   id: string | null;
-  stale: boolean;
+  /** Why the conflict guard refused the write, when it did. */
+  rejected: 'stale' | 'missing_timestamp' | null;
 }
 
 function buildUpsert({ entity, salesforceId, columns, fallback, updatedAt }: UpsertArgs): {
@@ -421,17 +457,17 @@ function buildUpsert({ entity, salesforceId, columns, fallback, updatedAt }: Ups
   );
 
   const assignments = dataColumns.map((column) => `${column} = EXCLUDED.${column}`);
-  assignments.push(
-    `salesforce_updated_at = COALESCE(EXCLUDED.salesforce_updated_at, ${table}.salesforce_updated_at)`,
-  );
+  // The guard below guarantees EXCLUDED.salesforce_updated_at is non-null on
+  // every conflict path, so the stamp can never be "kept" from a newer row.
+  assignments.push(`salesforce_updated_at = EXCLUDED.salesforce_updated_at`);
   assignments.push(`source = 'salesforce'`);
   assignments.push('synced_at = now()');
 
   // The stale-write guard lives here, in SQL: >= so an idempotent replay at an
-  // equal timestamp still writes, and a record with no timestamp is accepted
-  // (it cannot be proven older).
-  const guard = `EXCLUDED.salesforce_updated_at IS NULL
-      OR EXCLUDED.salesforce_updated_at >= COALESCE(${table}.salesforce_updated_at, 'epoch'::timestamptz)`;
+  // equal timestamp still writes. A record with no timestamp can only INSERT —
+  // it must never overwrite an existing row it cannot prove is older.
+  const guard = `EXCLUDED.salesforce_updated_at IS NOT NULL
+      AND EXCLUDED.salesforce_updated_at >= COALESCE(${table}.salesforce_updated_at, 'epoch'::timestamptz)`;
 
   return {
     text: `INSERT INTO ${table} (${insertColumns.join(', ')}, synced_at)
@@ -446,15 +482,16 @@ function buildUpsert({ entity, salesforceId, columns, fallback, updatedAt }: Ups
 async function upsertSalesforceRow(args: UpsertArgs): Promise<UpsertOutcome> {
   const statement = buildUpsert(args);
   const row = await queryOne<{ id: string }>(statement.text, statement.values);
-  if (row) return { id: row.id, stale: false };
+  if (row) return { id: row.id, rejected: null };
 
   // No row returned: the conflict guard rejected the write. Distinguish a stale
-  // skip from an unexpected no-op.
+  // skip from a missing-timestamp rejection and from an unexpected no-op.
   const existing = await queryOne<{ id: string }>(
     `SELECT id FROM ${TABLES[args.entity]} WHERE salesforce_id = $1`,
     [args.salesforceId],
   );
-  return { id: null, stale: Boolean(existing) };
+  if (!existing) return { id: null, rejected: null };
+  return { id: null, rejected: args.updatedAt === null ? 'missing_timestamp' : 'stale' };
 }
 
 async function resolveParentAccount(
@@ -506,13 +543,14 @@ export async function applySalesforceRecord(
     return { outcome: 'ignored', entity, id: null, reason: 'record has no Id' };
   }
 
+  const updatedAt = recordTimestamp(record);
+
   if (changeType === 'DELETE') {
-    return deleteSalesforceRecord(objectName, salesforceId);
+    // Forward the event timestamp so the delete is guarded too (null = no guard).
+    return deleteSalesforceRecord(objectName, salesforceId, { updatedAt });
   }
 
   // CREATE / UPDATE / UNDELETE all upsert.
-  const updatedAt = recordTimestamp(record);
-
   let columns: Record<string, unknown>;
   let fallback: Record<string, unknown> | undefined;
   let orphan: { entity: 'contact' | 'opportunity'; accountSalesforceId: string } | null = null;
@@ -545,17 +583,33 @@ export async function applySalesforceRecord(
 
   const outcome = await upsertSalesforceRow({ entity, salesforceId, columns, fallback, updatedAt });
   if (!outcome.id) {
-    return outcome.stale
-      ? {
-          outcome: 'skipped_stale',
-          entity,
-          id: null,
-          reason: 'incoming record is older than the stored salesforce_updated_at',
-        }
-      : { outcome: 'ignored', entity, id: null, reason: 'no row written' };
+    if (outcome.rejected === 'missing_timestamp') {
+      return { outcome: 'ignored', entity, id: null, reason: 'missing timestamp' };
+    }
+    if (outcome.rejected === 'stale') {
+      return {
+        outcome: 'skipped_stale',
+        entity,
+        id: null,
+        reason: 'incoming record is older than the stored salesforce_updated_at',
+      };
+    }
+    return { outcome: 'ignored', entity, id: null, reason: 'no row written' };
   }
 
   if (orphan) await rememberOrphanLink(orphan.entity, outcome.id, orphan.accountSalesforceId);
+
+  // CDC has no cross-topic ordering: a Contact/Opportunity can be applied
+  // before its Account. Re-link right after an Account lands so the CDC path
+  // does not wait for the next bulk extract.
+  if (entity === 'account') {
+    try {
+      await linkOrphanRecords();
+    } catch (error) {
+      // Re-linking is best-effort: it must never fail the record write.
+      console.error('[ingest] linkOrphanRecords failed after account upsert', error);
+    }
+  }
 
   return { outcome: 'applied', entity, id: outcome.id };
 }
@@ -598,10 +652,25 @@ export async function applySalesforceBatch(
   return totals;
 }
 
-/** Hard delete by `salesforce_id`. Used for CDC DELETE events. */
+export interface DeleteSalesforceOptions {
+  /**
+   * The DELETE event's timestamp. When it parses, the delete is guarded: a row
+   * whose `salesforce_updated_at` is newer is kept and the call reports
+   * `skipped_stale`. `null`/absent = unguarded (legacy behaviour).
+   */
+  updatedAt?: string | null;
+}
+
+/**
+ * Hard delete by `salesforce_id`. Used for CDC DELETE events.
+ *
+ * With `options.updatedAt` the timestamp comparison lives in the DELETE's
+ * `WHERE`, so a replayed or out-of-order DELETE cannot remove a newer row.
+ */
 export async function deleteSalesforceRecord(
   objectName: string,
   salesforceId: string,
+  options: DeleteSalesforceOptions = {},
 ): Promise<ApplyResult> {
   const entity = normaliseObject(objectName);
   if (entity === 'unknown') {
@@ -615,11 +684,37 @@ export async function deleteSalesforceRecord(
   const id = cleanText(salesforceId);
   if (!id) return { outcome: 'ignored', entity, id: null, reason: 'missing salesforce id' };
 
-  const row = await queryOne<{ id: string }>(
-    `DELETE FROM ${TABLES[entity]} WHERE salesforce_id = $1 RETURNING id`,
-    [id],
-  );
+  const table = TABLES[entity];
+  const guardedAt = parseSalesforceTimestamp(options.updatedAt);
+
+  const row = guardedAt
+    ? await queryOne<{ id: string }>(
+        `DELETE FROM ${table}
+          WHERE salesforce_id = $1
+            AND (salesforce_updated_at IS NULL OR salesforce_updated_at <= $2::timestamptz)
+          RETURNING id`,
+        [id, guardedAt],
+      )
+    : await queryOne<{ id: string }>(`DELETE FROM ${table} WHERE salesforce_id = $1 RETURNING id`, [
+        id,
+      ]);
   if (row) return { outcome: 'applied', entity, id: row.id, reason: 'deleted' };
+
+  if (guardedAt) {
+    // No row deleted: either the row is newer than the event, or there is none.
+    const existing = await queryOne<{ id: string }>(
+      `SELECT id FROM ${table} WHERE salesforce_id = $1`,
+      [id],
+    );
+    if (existing) {
+      return {
+        outcome: 'skipped_stale',
+        entity,
+        id: null,
+        reason: 'delete older than local row',
+      };
+    }
+  }
 
   return { outcome: 'ignored', entity, id: null, reason: 'no local row for salesforce id' };
 }

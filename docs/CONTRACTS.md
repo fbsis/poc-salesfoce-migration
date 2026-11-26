@@ -220,9 +220,14 @@ export interface ApplyResult {
 }
 
 /** Upsert one Salesforce record. Idempotent by salesforce_id.
- *  Never overwrites a newer row: compares the record's SystemModstamp
- *  (falls back to LastModifiedDate) against accounts/contacts/opportunities/
- *  leads.salesforce_updated_at and returns 'skipped_stale' when older. */
+ *  Never overwrites a newer row, without exceptions: compares the record's
+ *  SystemModstamp (falls back to LastModifiedDate, then the CDC
+ *  ChangeEventHeader.commitTimestamp) against accounts/contacts/opportunities/
+ *  leads.salesforce_updated_at and returns 'skipped_stale' when older. A record
+ *  whose timestamp is absent or unparseable may only insert: when a local row
+ *  already exists it is rejected as 'ignored' with reason 'missing timestamp'
+ *  and neither its data nor its stamp is written (a first insert without a
+ *  timestamp is accepted and keeps salesforce_updated_at NULL). */
 applySalesforceRecord(objectName: string, changeType: ChangeType, record: SalesforceRecord): Promise<ApplyResult>
 
 /** Bulk upsert, single transaction per record, returns per-outcome counts. */
@@ -316,7 +321,13 @@ Behaviour:
   duplicate — a new lead is created.
 - Validation error → `400 { "error": { "code": "validation_error", "message", "details": { field: message } } }`.
 - Rate limit: max 5 submissions / 10 min / IP → `429 { "error": { "code": "rate_limited" } }`.
-  In-memory sliding window is fine; document that it is per-process.
+  In-memory sliding window is fine; document that it is per-process. **Behind a
+  proxy, `X-Forwarded-For` (or `X-Real-IP`) must be set; without it the global
+  bucket applies** — with no IP header the per-IP limit is unavailable, so
+  unknown-IP traffic instead shares a generous per-process bucket
+  (60 submissions / 10 min) *and* a per-email guard (a 3rd landing-page
+  submission for the same email within 10 min → `429`). All three limits are
+  documented in `apps/web/lib/leads/rate-limit.ts`.
 - Honeypot field `company_website` filled → pretend success, store nothing.
 - Do not expose any other CRM endpoint publicly.
 
@@ -333,20 +344,24 @@ OAuth: `POST /services/oauth2/token` (form-encoded `grant_type=client_credential
 Every other endpoint requires `Authorization: Bearer mock-access-token`, else 401
 with a Salesforce-shaped error body.
 
-Bulk API 2.0 query jobs (real paths, `:version` = `v62.0`):
+Bulk query jobs (corrected) — Bulk API 2.0, `:version` = `v62.0`.
+A **query** job takes the SOQL in the *create* body; it has **no batch upload**
+(`PUT …/jobs/ingest/:id/batches` is ingest-only, and the mock does not implement
+ingest jobs at all — those paths answer 404). States: `UploadComplete` (guaranteed
+immediately) → `InProgress` → `JobComplete` / `Failed` / `Aborted`.
 
 | Method | Path | Behaviour |
 |---|---|---|
-| POST | `/services/data/:version/jobs/ingest` | body `{ object, operation: 'query', contentType: 'CSV', columnDelimiter, lineEnding }` → `201 { id, state: 'Open', object, operation }` |
-| PUT | `/services/data/:version/jobs/ingest/:id/batches` | body = CSV, header row = SOQL field list → `201` |
-| PATCH | `/services/data/:version/jobs/ingest/:id` | body `{ state: 'UploadComplete' }` → job state becomes `InProgress`, then `JobComplete` after a tick |
-| GET | `/services/data/:version/jobs/ingest/:id` | `{ id, state, numberRecordsProcessed, numberRecordsFailed, errorMessage }` |
-| GET | `/services/data/:version/jobs/ingest/:id/successfulResults` | CSV **with `sf__Id` and `sf__Created` columns** |
-| GET | `/services/data/:version/jobs/ingest/:id/failedResults` | CSV header only when no failures |
+| POST | `/services/data/:version/jobs/query` | body `{ operation: 'query', query: 'SELECT … FROM Account', contentType: 'CSV', columnDelimiter: ',', lineEnding: 'LF' }` → `200 { id, operation: 'query', object, createdById, createdDate, systemModstamp, state: 'UploadComplete', jobType: 'V2Query', numberRecordsProcessed: 0, numberRecordsFailed: 0, retries, totalProcessingTime, errorMessage }` |
+| GET | `/services/data/:version/jobs/query/:id` | `{ id, state, numberRecordsProcessed, numberRecordsFailed, retries, totalProcessingTime, errorMessage }` — poll until `JobComplete` |
+| GET | `/services/data/:version/jobs/query/:id/results` | CSV whose header is **exactly the SELECT list** (`Id,Name,Industry,…`); no `sf__Id` / `sf__Created`. Zero rows still returns the header row. Paged: max `2000` rows per page, the next token is the `Sforce-Query-Locator` response header, echoed back as `?locator=<token>`; the last page sends `Sforce-Query-Locator: null`. An invalid locator is `400 INVALID_PARAMETER`, and a job that is not `JobComplete` is `400 INVALIDJOBSTATE`. |
+| PUT | `/services/data/:version/jobs/query/:id/batches` | **404** — a query job takes no data (this used to be the fake SOQL-as-CSV upload) |
+| POST | `/services/data/:version/jobs/ingest…` | **404** — ingest jobs are out of scope for this mock |
 
 SOQL: `GET /services/data/:version/query?q=SELECT+Id,Name+FROM+Account` — supports
 the shapes the worker sends (`SELECT … FROM <Object> [WHERE SystemModstamp >= X]`,
 optional `LIMIT`). Response `{ totalSize, done: true, records: [{ attributes: { type }, … }] }`.
+Unlike a query *job*, this endpoint injects `Id` when the caller omits it.
 
 Admin (no auth, test/demo only):
 
@@ -357,7 +372,8 @@ Admin (no auth, test/demo only):
 | POST | `/mock/reset` | clears dataset + event log |
 | POST | `/mock/emit` | `{ object, changeType, record }` → publishes a CDC event to all subscribers of that topic (deferred until a subscriber is attached; queue it) |
 | POST | `/mock/disconnect` | `{ topic? }` → forcibly ends matching gRPC streams (simulates consumer interruption) |
-| GET | `/mock/health` | `{ status: 'ok', dataset: {...counts}, subscribers: n }` |
+| GET | `/mock/health` | `{ status: 'ok', dataset: {...counts}, subscribers: n, queryJobPageSize }` |
+| GET/POST | `/mock/config` | `{ queryJobPageSize }` — read/set rows per query-result page (1…2000); the test hook that makes `Sforce-Query-Locator` paging observable |
 
 ### gRPC Pub/Sub (port 50051)
 
