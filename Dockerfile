@@ -7,14 +7,17 @@ WORKDIR /app
 
 # --- dependencies (cached on lockfile/package.json changes) -----------------
 FROM base AS deps
-COPY pnpm-workspace.yaml package.json ./
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
 COPY packages/core/package.json packages/core/
 COPY packages/salesforce/package.json packages/salesforce/
 COPY apps/web/package.json apps/web/
 COPY apps/mcp/package.json apps/mcp/
 COPY apps/worker/package.json apps/worker/
 COPY apps/salesforce-mock/package.json apps/salesforce-mock/
-RUN pnpm install --no-frozen-lockfile
+# Frozen: the lockfile is committed, so a rebuild cannot silently resolve new
+# versions. Refresh it on purpose with:
+#   docker compose run --rm --entrypoint sh tools -c 'pnpm install --lockfile-only'
+RUN pnpm install --frozen-lockfile
 
 # --- runtime ---------------------------------------------------------------
 FROM deps AS runtime
