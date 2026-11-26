@@ -126,6 +126,18 @@ services:
     volumes: *node-volumes
     ports:
       - "3002:3002"
+    healthcheck:
+      # Probes the control plane, which only answers once the process is up, so a
+      # dead worker can no longer be reported as "Up" by docker compose ps.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3002/health',{headers:{authorization:'Bearer '+(process.env.CRM_API_TOKEN||'')}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 45s
     depends_on:
       postgres:
         condition: service_healthy

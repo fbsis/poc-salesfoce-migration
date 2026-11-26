@@ -100,8 +100,15 @@ docker compose up -d                      # postgres, salesforce-mock, web, mcp,
 docker compose run --rm tools pnpm migrate # apply db/migrations/001_init.sql (idempotent)
 ```
 
-Wait for the healthchecks (`docker compose ps` → `postgres` and `salesforce-mock` report
-`healthy`; `web`/`mcp` have healthchecks too, `worker` does not — see `docs/FINDINGS.md` §3).
+Wait for the healthchecks — every service reports `healthy` in `docker compose ps`
+(`worker` is probed through its control plane on `:3002`, so `ps` can no longer show a dead
+process as `Up`).
+
+This exact sequence was validated from scratch (2026-11-26): `docker compose down -v` (all
+volumes removed, Postgres included), `docker compose build`, `docker compose up -d` → five
+healthy services, `db/postgres-init.sh` created both databases, `pnpm migrate` was a no-op,
+the worker extracted 19 records and opened a `cdc` sync run, and the suite passed 28 files /
+218 tests on the fresh stack.
 
 The worker seeds itself: on boot in `all` mode it runs a bulk extract (unless a bulk run succeeded in
 the last 10 minutes) and then starts the CDC consumer on all four topics.
