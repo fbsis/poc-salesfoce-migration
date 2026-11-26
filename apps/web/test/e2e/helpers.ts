@@ -627,10 +627,18 @@ export function e2eIds(dataset: E2EDataset): E2EIds {
   };
 }
 
-/** True for records this suite seeded (their id embeds the run marker). */
+/**
+ * Salesforce id of any E2E fixture, from this run or an earlier one
+ * (`<prefix>E2E<6 hex><tag>`), i.e. the POSIX pattern used by Postgres `~`.
+ * Matching *all* runs is deliberate: a suite that was killed mid-run must not
+ * leave rows in the mock that every later bulk extract re-imports.
+ */
+export const E2E_ID_REGEX = 'E2E[0-9A-F]{6}';
+
+/** True for records this suite seeded, from any run. */
 export function isE2ERecord(row: unknown): boolean {
   const id = String((row as SfRecord | null)?.Id ?? '').toUpperCase();
-  return id.includes(E2E_MARKER);
+  return new RegExp(E2E_ID_REGEX).test(id);
 }
 
 function withoutE2ERows(rows: SfRecord[] | undefined): SfRecord[] {
@@ -670,29 +678,30 @@ export async function restoreMockDataset(): Promise<void> {
 }
 
 /**
- * Removes every row this run created (matched by the `E2E<RUN>` marker or the
- * run-scoped email prefix) and restores the mock to its demo dataset. Only
- * this run's rows are affected; demo data is never touched.
+ * Removes every E2E row (this run's, plus any orphaned by an interrupted run)
+ * and restores the mock to its demo dataset. Only fixture rows are matched by
+ * id shape / email prefix; demo data is never touched and `/mock/reset` is never
+ * called.
  */
 export async function cleanupE2EData(): Promise<void> {
-  const sfPattern = `%${E2E_MARKER}%`;
-  const emailPattern = `e2e-${RUN.toLowerCase()}-%@example.test`;
+  const emailPattern = 'e2e-%@example.test';
 
-  await query(`DELETE FROM cdc_events WHERE record_id ILIKE $1`, [sfPattern]);
-  await query(
-    `DELETE FROM sf_orphan_links
-      WHERE account_salesforce_id ILIKE $1
-         OR local_id IN (SELECT id FROM contacts WHERE salesforce_id ILIKE $1)
-         OR local_id IN (SELECT id FROM opportunities WHERE salesforce_id ILIKE $1)`,
-    [sfPattern],
-  );
-  await query(`DELETE FROM opportunities WHERE salesforce_id ILIKE $1`, [sfPattern]);
-  await query(`DELETE FROM contacts WHERE salesforce_id ILIKE $1`, [sfPattern]);
-  await query(`DELETE FROM leads WHERE salesforce_id ILIKE $1 OR lower(email) LIKE $2`, [
-    sfPattern,
+  await query(`DELETE FROM cdc_events WHERE record_id ~ $1`, [E2E_ID_REGEX]);
+  await query(`DELETE FROM sf_orphan_links WHERE account_salesforce_id ~ $1`, [E2E_ID_REGEX]);
+  await query(`DELETE FROM opportunities WHERE salesforce_id ~ $1`, [E2E_ID_REGEX]);
+  await query(`DELETE FROM contacts WHERE salesforce_id ~ $1`, [E2E_ID_REGEX]);
+  await query(`DELETE FROM leads WHERE salesforce_id ~ $1 OR lower(email) LIKE $2`, [
+    E2E_ID_REGEX,
     emailPattern,
   ]);
-  await query(`DELETE FROM accounts WHERE salesforce_id ILIKE $1`, [sfPattern]);
+  await query(`DELETE FROM accounts WHERE salesforce_id ~ $1`, [E2E_ID_REGEX]);
+  // Garbage-collect links whose local row no longer exists (created by a run
+  // that was interrupted between the insert and the account arriving).
+  await query(
+    `DELETE FROM sf_orphan_links o
+      WHERE NOT EXISTS (SELECT 1 FROM contacts c WHERE c.id = o.local_id)
+        AND NOT EXISTS (SELECT 1 FROM opportunities p WHERE p.id = o.local_id)`,
+  );
 
   await restoreMockDataset();
 }

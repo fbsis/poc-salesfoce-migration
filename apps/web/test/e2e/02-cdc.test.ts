@@ -81,7 +81,7 @@ describe(
       return body.data;
     }
 
-    it('applies an UPDATE within 15s and records a small positive latency', async () => {
+    it('applies an UPDATE within 15s and records the measured latency', async () => {
       const salesforceId = ids.opportunities[0];
       const before = await getOpportunity(salesforceId);
       expect(before, `seeded opportunity ${salesforceId}`).not.toBeNull();
