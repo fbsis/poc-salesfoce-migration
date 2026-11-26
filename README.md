@@ -95,7 +95,7 @@ imports both.
 Prerequisites: **Docker only** (with Compose v2). No Node, no pnpm, no psql, no local Postgres.
 
 ```bash
-git clone <repo> && cd poc-salesforce-migration
+git clone https://github.com/fbsis/poc-salesfoce-migration.git && cd poc-salesfoce-migration
 docker compose up -d                      # postgres, salesforce-mock, web, mcp, worker
 docker compose run --rm tools pnpm migrate # apply db/migrations/001_init.sql (idempotent)
 ```
@@ -264,9 +264,12 @@ This is a technical validation, and the honest list of what it is not is
 | Document | What it is |
 |---|---|
 | [`docs/POC-CHECKLIST.md`](docs/POC-CHECKLIST.md) | The client's checklist, ticked against evidence, with annotations where it is mock-only |
+| [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md) | **Start here to understand it**: the whole system explained with 11 diagrams (context, ER, bulk, CDC incl. failure/redrive, leads, MCP, emulator, testing) |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Data model, the four flows, failure modes, design decisions and the alternatives rejected |
 | [`docs/FINDINGS.md`](docs/FINDINGS.md) | What was proven, what was not, open defects, production requirements, six-month cutover plan |
 | [`docs/DEMO.md`](docs/DEMO.md) | Six-demo runbook |
+| [`docs/EXPLAINING.md`](docs/EXPLAINING.md) | How to present it: narrative, whiteboard script, analogies, objection handling, audience tracks |
+| [`docs/PRODUCTION-DOCKER.md`](docs/PRODUCTION-DOCKER.md) | Running this in production on Docker: prod Dockerfile/compose, migrations, TLS, observability, 16-item hardening table |
 | [`docs/AUDIT.md`](docs/AUDIT.md) | Adversarial audit of the build (17 findings) — the source of the open-defect list |
 | [`docs/CONTRACTS.md`](docs/CONTRACTS.md) | The build spec the agents worked from |
 | [`docs/AI-ACCELERATORS.md`](docs/AI-ACCELERATORS.md) | Checklist §7 research: Salesforce MCP, AppFlow, EventBridge, HubSpot, deterministic automation |
