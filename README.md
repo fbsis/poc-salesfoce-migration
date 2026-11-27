@@ -20,7 +20,7 @@ Everything runs in Docker Compose. Nothing is installed on the host.
 > | 4 | Public lead capture | `POST /api/leads` → **201**; same email → **200 `duplicate:true`** with the same id; invalid → **400** with per-field errors; 6th rapid submission → **429**; honeypot → **201** decoy and 0 rows; lead visible in `/crm/leads` HTML |
 > | 5 | MCP for AI agents | `initialize` + `tools/list` → exactly **17** contract tools; `update_lead_status` → `contacted`, verified through `/api/crm/leads/:id` **and** the rendered page; `POST /mcp` without a token → **401** |
 >
-> Test suite: **28 files / 218 tests** (5 skipped), green on two consecutive runs of ~25 s each
+> Test suite: **28 files / 218 tests**, none skipped, green on consecutive runs of ~25 s each
 > (`docker compose run --rm tools pnpm test`, commit `ac527fc`). Typecheck: 6 workspace packages,
 > clean. The committed behaviour those numbers cover **includes** the CDC retry / head-of-line block
 > / `POST :3002/run/redrive` + `POST :3002/run/discard` path and the `cdc` row in `sync_runs`
